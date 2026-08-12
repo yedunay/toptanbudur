@@ -1,0 +1,27 @@
+/* Renk token'ları burada TANIMLANMAZ.
+   `--ab-*` seti artık tek kaynakta: apps/frontend/app/globals.css (:root).
+   Eskiden bu dosya + app/hesabim/page.module.css + app/hesabim/siparislerim/
+   page.module.css birebir kopyaydı ve globals.css ile ÇELİŞEN hex'ler
+   taşıyordu. */
+.accountPage {
+  min-height: 100vh;
+  background:
+    radial-gradient(
+      circle at top right,
+      rgba(17, 11, 107, 0.06),
+      transparent 34rem
+    ),
+    var(--color-ink-25);
+  color: var(--ab-text);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .accountPage *,
+  .accountPage *::before,
+  .accountPage *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}

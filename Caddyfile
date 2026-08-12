@@ -1,0 +1,86 @@
+# Toptan Budur — Production Caddyfile
+# Single domain reverse proxy for storefront, admin SPA, and API.
+# HTTPS auto-issued via Let's Encrypt.
+#
+# NOT: Sunucuda varsayılan reverse proxy nginx'tir (docker-compose.prod.yml +
+# infra/nginx). Bu dosya, nginx yerine Caddy tercih edilirse kullanılacak
+# alternatif yapılandırmadır.
+
+{
+	# Replace with the operator email used for ACME notifications.
+	email ops@toptanbudur.com
+}
+
+# Redirect www → apex (301)
+www.toptanbudur.com {
+	redir https://toptanbudur.com{uri} permanent
+}
+
+toptanbudur.com {
+	encode zstd gzip
+
+	# Global security headers
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+		X-Content-Type-Options "nosniff"
+		# SAMEORIGIN (DENY değil): PayTR, ödeme sonrası müşteriyi iframe
+		# İÇİNDE bizim /sepet/odeme/sonuc sayfamıza yönlendirir — DENY kendi
+		# sayfamızın kendi sitemizde framelenmesini de engelleyip ödeme
+		# sonrası BOŞ EKRAN bırakır. Yabancı site framelemesi SAMEORIGIN ile
+		# yine engellidir.
+		X-Frame-Options "SAMEORIGIN"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		Permissions-Policy "camera=(), microphone=(), geolocation=()"
+		# Remove server fingerprint
+		-Server
+	}
+
+	# ----- API → NestJS (path /api preserved; backend uses global prefix /api) -----
+	@api path /api /api/*
+	handle @api {
+		reverse_proxy localhost:4000 {
+			header_up Host {host}
+			header_up X-Real-IP {remote_host}
+			header_up X-Forwarded-For {remote_host}
+			header_up X-Forwarded-Proto {scheme}
+		}
+	}
+
+	# ----- Admin SPA (Vite, served under /admin) -----
+	# handle_path strips /admin so Vite (with base: '/admin/') still resolves assets.
+	# In dev/prod, Vite preview/proxy responds to /admin/* directly thanks to base path.
+	handle /admin/* {
+		header {
+			X-Robots-Tag "noindex, nofollow"
+		}
+		reverse_proxy localhost:3002 {
+			header_up Host {host}
+			header_up X-Real-IP {remote_host}
+			header_up X-Forwarded-For {remote_host}
+			header_up X-Forwarded-Proto {scheme}
+		}
+	}
+	# Bare /admin → /admin/
+	handle /admin {
+		redir /admin/ 308
+	}
+
+	# ----- Storefront (Next.js) — catch-all -----
+	handle {
+		reverse_proxy localhost:3001 {
+			header_up Host {host}
+			header_up X-Real-IP {remote_host}
+			header_up X-Forwarded-For {remote_host}
+			header_up X-Forwarded-Proto {scheme}
+		}
+	}
+
+	# Access log
+	log {
+		output file /var/log/caddy/toptanbudur.access.log {
+			roll_size 50mb
+			roll_keep 7
+		}
+		format json
+	}
+}

@@ -1,0 +1,2529 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model Tenant {
+  id        String   @id @default(cuid())
+  slug      String   @unique
+  name      String
+  plan      Plan     @default(STARTER)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  users                 User[]
+  suppliers             Supplier[]
+  orders                Order[]
+  dealers               Dealer[]
+  // ─── Tedarikçi Bakiye Senkronu (kâr/maliyetten BAĞIMSIZ modül) ───────────
+  supplierAccounts      SupplierAccount[]
+  supplierAccountLedger SupplierAccountLedger[]
+  // ─── Kredi Kartı Tahsilat Makbuzları ─────────────────────────────────────
+  paymentReceipts       PaymentReceipt[]
+  // ─── Aylık Finans ve Ortak Dağılım Paneli ────────────────────────────────
+  financePartners          FinancePartner[]
+  financeExpenseTemplates  FinanceExpenseTemplate[]
+  financeExpenses          FinanceExpense[]
+  financeIntegrationEntries FinanceIntegrationEntry[]
+  financePartnerAdvances   FinancePartnerAdvance[]
+}
+
+enum Plan {
+  STARTER
+  GROWTH
+  PRO
+}
+
+enum Role {
+  OWNER
+  ADMIN
+  MEMBER
+  CUSTOMER
+}
+
+enum SupplierAuthType {
+  NONE
+  BASIC
+  BEARER
+}
+
+/// Müşteri statüsü. STANDARD = normal fiyatlandırma akışı (liste fiyatı +
+/// global/tedarikçi iskontosu). ADMIN_DISCOUNT = admin/iç-kullanıcı müşterisi;
+/// sipariş satır kalemleri costPrice (maliyet) üzerinden hesaplanır, paketleme
+/// ücreti normal şekilde eklenir.
+enum CustomerStatus {
+  STANDARD
+  ADMIN_DISCOUNT
+}
+
+model User {
+  id                 String   @id @default(cuid())
+  tenantId           String
+  email              String   @unique
+  passwordHash       String
+  name               String?
+  role               Role     @default(OWNER)
+  mustChangePassword Boolean  @default(false)
+  // OTP_MODE=optional iken kullanıcının kendi 2FA tercihini taşır.
+  // Default `false`: optional moda geçildiğinde kullanıcı kendi açana
+  // kadar OTP istemez (sürpriz 2FA önlenir).
+  // OTP_MODE=required ise yok sayılır (zaten zorunlu),
+  // OTP_MODE=disabled ise yok sayılır (zaten kapalı).
+  otpEnabled         Boolean  @default(true)
+  profilePhotoUrl    String?
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  tenant                  Tenant                  @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  decidedCariPayments     CariPayment[]           @relation("CariPaymentDecidedBy")
+  decidedCariTopups       CariTopup[]             @relation("CariTopupDecidedBy")
+  createdCariLedger       CariLedger[]            @relation("CariLedgerCreatedBy")
+  refreshTokens           RefreshToken[]
+  adminOtps               AdminOtp[]
+  trustedDevices          AdminTrustedDevice[]
+  pagePermissions         UserPagePermission[]
+  // ─── Tedarikçi Bakiye Senkronu — manuel işlemleri yapan admin ────────────
+  supplierLedgerEntries   SupplierAccountLedger[] @relation("SupplierLedgerCreatedBy")
+  // ─── Depo (Faz 1.7) ─────────────────────────────────────────
+  // Yalnızca OWNER kullanıcıların evlerindeki dark inventory. Müşteri,
+  // pazaryeri veya XML feed bu stoğu ASLA görmez. Sipariş geldiğinde
+  // OrderItem üzerine rezerve edilir.
+  houseStockItems         HouseStockItem[]
+  houseStockSettings      HouseStockSettings?
+  houseStockSalesLogs     HouseStockSalesLog[]
+  // Bu OWNER'a rezerve edilmiş OrderItem'lar (deterministic dispatch için).
+  houseStockReservedItems OrderItem[]             @relation("OrderItemHouseStockOwner")
+  // ─── Finans API — bu kullanıcı bir ortağa bağlıysa ──────────────────────
+  financePartner          FinancePartner?         @relation("FinancePartnerUser")
+
+  @@index([tenantId])
+}
+
+/**
+ * UserPagePermission — Per-user page access override. Role'a göre türetilen
+ * varsayılan izinlerin (role-templates.ts) üzerine binerek hem ekleme hem
+ * de çıkarma yapılmasını sağlar. Bir kullanıcının efektif izin seti şu
+ * formülle hesaplanır:
+ * role_defaults ∪ (overrides where granted=true) − (overrides where granted=false)
+ * OWNER her zaman tüm izinlere sahiptir; bu tablo OWNER için yok sayılır.
+ */
+model UserPagePermission {
+  id        String   @id @default(cuid())
+  userId    String
+  pageKey   String
+  granted   Boolean
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, pageKey])
+  @@index([userId])
+}
+
+/**
+ * RefreshToken — JWT refresh token rotation desteği için. Her aktif refresh
+ * token bir satır olarak tutulur (jti tablonun anahtarı). Token kullanıldığında
+ * eski jti revoke edilir (revokedAt) ve yeni bir satır açılır. expiresAt
+ * geçtikten sonra token reddedilir. Cleanup cron'u (opsiyonel) süresi dolmuş
+ * kayıtları temizleyebilir.
+ */
+model RefreshToken {
+  id        String    @id @default(cuid())
+  jti       String    @unique
+  userId    String
+  tenantId  String?
+  expiresAt DateTime
+  revokedAt DateTime?
+  createdAt DateTime  @default(now())
+  userAgent String?   @db.Text
+  ip        String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+model Supplier {
+  id                 String    @id @default(cuid())
+  tenantId           String
+  name               String
+  profitMargin       Decimal   @default(20) @db.Decimal(10, 4)
+  // SATIŞ kâr tipi: "fixed" = tek profitMargin(%) + extraCostTry(TL) (mevcut davranış);
+  // "tiered" = profitTiers baremleri (Fiyata Göre Kademeli Kâr). Yalnız SATIŞ fiyatını
+  // etkiler — maliyet/cüzdan/kâr hep costPrice'tan (tek kaynak), değişmez.
+  profitType         String    @default("fixed")
+  // Kademeli kâr baremleri (profitType="tiered" iken). JSON dizi; her eleman:
+  //   { min:Number, max:Number|null(∞), rateType:"percent"|"amount", rate:Number, extraCosts:Number[] }
+  // Barem ürünün ALIŞ maliyetine (costPrice) göre seçilir. Baremler [0,∞) bitişik.
+  // satış = (percent: cost*(1+rate/100)) | (amount: cost+rate) + Σ extraCosts. fixed modda yok sayılır.
+  profitTiers        Json?
+  stockThreshold     Int       @default(0)
+  marketplaces       String[]
+  active             Boolean   @default(true)
+  includeInOwnFeed   Boolean   @default(true)
+  categoriesSyncedAt DateTime?
+  mandatoryCarriers  String[]  @default([])
+  requiresPdf        Boolean   @default(false)
+  // PTTAvm ile satış yapılabilir mi. true ise bu tedarikçinin ürünlerinde
+  // alımda "PTTAvm" pazaryeri seçilebilir; PTTAvm seçilince kargo ZORUNLU PTT
+  // ve kargo PDF'i ZORUNLU olur (tedarikçinin requiresPdf ayarından bağımsız).
+  pttavmEnabled      Boolean   @default(false)
+  leadTimeDays       Int?
+  priceIncludesVat   Boolean   @default(false)
+  // SATIŞ tarafı: ek kâr (TL) — kâr marjından SONRA satış fiyatına eklenir.
+  extraCostTry       Decimal   @default(0) @db.Decimal(12, 2)
+  minPrice           Decimal   @default(1.0) @db.Decimal(12, 2)
+  // ── TEK KAYNAK ALIŞ FİYATLANDIRMA ─────────────────────────────────────────
+  // Tüm maliyet/satış/bakiye/kâr hesapları bu alanlardan türeyen TEK costPrice'a
+  // dayanır (çift sayım yok). Zincir: XML fiyatı → (indirim % ve TL) →
+  // (priceIncludesVat ise purchaseVatRate ile KDV düş) → costPrice (gerçek net alış).
+  // KDV oranı (10/20). KDV strip (ingest) VE tedarikçi cüzdanı/kâr brüt-leştirmesi
+  // için TEK rate; eski per-ürün taxRate + ProfitabilityConfig.purchaseKdvRate yerine.
+  purchaseVatRate    Int       @default(20)
+  // Alış indirimi (%) — XML fiyatına ingest'te uygulanır (tek alan; KDV dahil/hariç
+  // ayrımı yok, yüzde indirim her iki tabanda matematiksel olarak denktir).
+  purchaseDiscountInclVatPct Decimal @default(0) @db.Decimal(8, 4)
+  // Alış indirimi (TL) — XML fiyatına ingest'te uygulanır (yüzdeyle birlikte).
+  purchaseDiscountTl Decimal   @default(0) @db.Decimal(12, 2)
+  // Alış EK MALİYETİ (TL) — birim başına gerçek maliyete eklenir (kargo/komisyon/
+  // hizmet bedeli). KDV strip + indirimden SONRA net costPrice'a eklenir; satış/
+  // cüzdan/kâr hepsi bu maliyete dayanır.
+  purchaseExtraCostTl Decimal  @default(0) @db.Decimal(12, 2)
+  // DEPRECATED: eski ikinci indirim alanı (KDV hariç). Artık kullanılmıyor;
+  // tek "alış indirimi %" purchaseDiscountInclVatPct'tir. Veri kaybı olmasın
+  // diye kolon korunuyor, ileride drop edilecek.
+  purchaseDiscountExclVatPct Decimal @default(0) @db.Decimal(8, 4)
+  createdAt          DateTime  @default(now())
+  updatedAt          DateTime  @updatedAt
+
+  tenant               Tenant                     @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  feeds                SupplierFeed[]
+  products             Product[]
+  brandMappings        SupplierBrandMapping[]
+  textRules            SupplierTextRule[]
+  categories           SupplierCategory[]
+  customerDiscounts    CustomerSupplierDiscount[]
+  orderItemOverrides   OrderItem[]                @relation("OrderItemSupplierOverride")
+  // ─── Tedarikçi Bakiye Senkronu (kâr/maliyetten BAĞIMSIZ) ─────────────────
+  account              SupplierAccount?
+  accountLedger        SupplierAccountLedger[]
+
+  @@index([tenantId])
+}
+
+model SupplierFeed {
+  id                       String           @id @default(cuid())
+  supplierId               String
+  tenantId                 String
+  name                     String           @default("Ana Feed")
+  feedUrl                  String
+  encryptedApiKey          String?
+  authType                 SupplierAuthType @default(NONE)
+  authCredentialsEncrypted String?
+  refreshIntervalHours     Int              @default(6)
+  feedCurrency             String?          @default("TRY")
+  exchangeRate             Decimal?         @db.Decimal(10, 4)
+  exchangeRateMargin       Decimal          @default(0) @db.Decimal(8, 4)
+  active                   Boolean          @default(true)
+  lastSyncedAt             DateTime?
+  lastSyncError            String?          @db.Text
+  // Son SAĞLIKLI senkrondaki feed ürün sayısı (staleness guard baseline'ı).
+  // Guard artık birikmiş yetim yığınının DB oranına değil, feed'in KENDİ
+  // önceki sağlıklı sayısına göre "feed truncate oldu mu" bakar; böylece
+  // tedarikçi kataloğu meşru şekilde büyük oranda değişse/küçülse bile
+  // (ör. Product_code şeması migrasyonu) guard kalıcı kilitlenmez.
+  lastFeedItemCount        Int?
+  createdAt                DateTime         @default(now())
+  updatedAt                DateTime         @updatedAt
+
+  supplier Supplier  @relation(fields: [supplierId], references: [id], onDelete: Cascade)
+  products Product[]
+
+  @@index([supplierId])
+  @@index([tenantId])
+}
+
+/**
+ * SupplierBrandMapping — XML feed'inden gelen brand isimlerini bizim
+ * normalize markamıza eşler (ör. "F.B.I" → "FBI"). hidden=true ise bu
+ * brand'in tüm ürünleri sitede görünmez (active=false + marketplaceListed=false).
+ * Kullanım: Admin "tedarikçi config" sayfasında brand listesi alır,
+ * her satıra hedef brand seçer veya gizle işaretler. IngestService her
+ * sync'te bu mapping'i uygular — yeni eklenen brand'ler mapping bulunamazsa
+ * orijinal isimle gelir, kullanıcı sonradan eşleyince bir sonraki sync'te
+ * effect alır.
+ */
+model SupplierBrandMapping {
+  id              String   @id @default(cuid())
+  supplierId      String
+  sourceBrandName String
+  targetBrandName String?
+  hidden          Boolean  @default(false)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  supplier Supplier @relation(fields: [supplierId], references: [id], onDelete: Cascade)
+
+  @@unique([supplierId, sourceBrandName])
+  @@index([supplierId])
+}
+
+/**
+ * SupplierTextRule — bir tedarikçinin ürün adı ve/veya açıklamasından istenmeyen
+ * metni SİLEN veya DEĞİŞTİREN literal (regex DEĞİL) kurallar. Örn. bir marka
+ * adını sil ya da başka bir metinle değiştir. Kurallar tedarikçinin TÜM ürünlerine (yeni +
+ * mevcut) uygulanır ve hem mağaza gösteriminde hem giden XML feed'inde etkilidir.
+ *
+ * search:           aranan literal metin (boş olamaz)
+ * replacement:      yerine yazılacak metin ("" = sil)
+ * applyToName:      ürün adına uygula
+ * applyToDescription: açıklamaya uygula
+ * caseInsensitive:  büyük/küçük harf duyarsız eşleşme
+ * wholeWord:        yalnızca tam kelime eşleşmesi (kelime sınırı)
+ * sortOrder:        kuralların uygulanma sırası (küçük → önce)
+ *
+ * Ingest her sync'te bu kuralları normalize sonrası uygular; admin kuralları
+ * değiştirdiğinde mevcut ürünler BullMQ recompute job'ı ile rawFeedName/
+ * rawFeedDescription'dan yeniden türetilir (contentNormalizedAt'a dokunmadan).
+ */
+model SupplierTextRule {
+  id                 String   @id @default(cuid())
+  supplierId         String
+  tenantId           String
+  search             String
+  replacement        String   @default("")
+  applyToName        Boolean  @default(true)
+  applyToDescription Boolean  @default(true)
+  caseInsensitive    Boolean  @default(true)
+  wholeWord          Boolean  @default(false)
+  enabled            Boolean  @default(true)
+  sortOrder          Int      @default(0)
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  supplier Supplier @relation(fields: [supplierId], references: [id], onDelete: Cascade)
+
+  @@index([supplierId])
+  @@index([tenantId])
+}
+
+/**
+ * SupplierCategory — bir tedarikçinin XML feed'inden öğrenilen ham kategori
+ * ağacı. POST /api/admin/suppliers/:id/sync-categories endpoint'i feed'i
+ * tarayarak distinct kategorileri bu tabloya yazar; supplier.categoriesSyncedAt
+ * güncellenir. path[] kategori hiyerarşisi (parent → child) — Postgres String[]
+ * kullanılarak tek bir alanda sırayla tutulur.
+ */
+model SupplierCategory {
+  id         String   @id @default(cuid())
+  supplierId String
+  // Tedarikçinin kendi kategori kodu (varsa). Boş gelirse name'in slug'ı kullanılır.
+  code       String
+  name       String
+  // Üst kategorinin code'u. Kök kategoriler için null.
+  parentCode String?
+  // Kategori path hiyerarşisi: ['Aksesuar','Bagaj Aksesuarları'] gibi.
+  path       String[]
+  // Aktif değilse bu kategoriye ait feed ürünleri ingest tarafından atlanır.
+  // Admin UI üzerinden tek tek toggle edilir; deactivation mevcut ürünleri
+  // bir sonraki sync'te deactive eder (stale deactivation pattern).
+  isActive   Boolean  @default(true)
+  // Kategori bazlı fiyatlandırma override'ı. null ise tedarikçinin global
+  // ayarı (Supplier.profitMargin / Supplier.extraCostTry) kullanılır. Sadece
+  // bu kategoriye TAM eşleşen (Category.path === code) ürünler etkilenir.
+  // Her alan bağımsız override edilebilir (sadece marj veya sadece ek kâr).
+  marginPercentOverride Decimal? @db.Decimal(10, 4)
+  extraCostTryOverride  Decimal? @db.Decimal(12, 2)
+  // Kategori bazlı KÂR TİPİ override'ı. null = tedarikçiden miras (Supplier.profitType).
+  // "fixed" → yukarıdaki marginPercentOverride/extraCostTryOverride (yoksa global) kullanılır.
+  // "tiered" → categoryProfitTiers baremleri kullanılır (Supplier.profitTiers'ı EZER).
+  profitTypeOverride    String?
+  // Kategori bazlı kademeli kâr baremleri (profitTypeOverride="tiered" iken). Şema Supplier.profitTiers ile aynı.
+  profitTiers           Json?
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  supplier Supplier @relation(fields: [supplierId], references: [id], onDelete: Cascade)
+
+  @@unique([supplierId, code])
+  @@index([supplierId])
+  @@index([supplierId, parentCode])
+}
+
+model Category {
+  id        String   @id @default(cuid())
+  tenantId  String
+  parentId  String?
+  name      String
+  slug      String
+  path      String
+  depth     Int      @default(0)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  parent   Category?  @relation("CategoryTree", fields: [parentId], references: [id], onDelete: SetNull)
+  children Category[] @relation("CategoryTree")
+  products Product[]
+
+  @@unique([tenantId, path])
+  @@index([tenantId, parentId])
+}
+
+model Product {
+  id                  String    @id @default(cuid())
+  tenantId            String
+  supplierId          String
+  feedId              String?
+  categoryId          String?
+  externalCode        String
+  slug                String
+  name                String
+  // Tedarikçi XML feed'indeki HAM ürün adı (normalize/temizleme öncesi — ör.
+  // marka önekleri dahil). Müşteriye gösterilen 'name' temizlenir; bu alan
+  // YALNIZCA alım/Excel akışı için tedarikçiye orijinal adı iletmekte kullanılır.
+  // Ingest'te yazılır; mevcut ürünler bir sonraki feed sync'inde dolar.
+  rawFeedName         String?
+  brand               String?
+  // sourceBrand: XML feed'inden gelen ham marka adı (mapping uygulanmadan önce).
+  // brand alanı mapping uygulanmış "etkili" marka olarak korunur (mağazada
+  // gösterim için). listBrands distinct'i ve mapping lookup'ı her zaman
+  // sourceBrand üzerinden yapılır — böylece target marka asla source listesinde
+  // gözükmez (sonsuz döngü bug'ı).
+  sourceBrand         String?
+  model               String?
+  description         String?   @db.Text
+  // Tedarikçi XML feed'indeki HAM açıklama (normalize + metin kuralları öncesi).
+  // Tedarikçi bazlı metin kuralları (SupplierTextRule) değiştiğinde 'description'
+  // bu ham kaynaktan deterministik şekilde yeniden türetilebilsin diye saklanır.
+  // rawFeedName'in açıklama karşılığı.
+  rawFeedDescription  String?   @db.Text
+  barcode             String?
+  // TBDR* prefix'li public barkod — müşteri-yüzlü endpoint'lerde orijinal
+  // barcode yerine bu döner. Bir kere üretildikten sonra üründe sabit kalır.
+  publicBarcode       String?   @unique
+  // TBDR-XXXXXX formatında dahili stok kodu. İlk ingest anında bir kez atanır,
+  // sonsuza kadar değişmez. Tedarikçi kodu (externalCode) ne olursa olsun
+  // bu kod sabit kalır. Müşteriye "Stok Kodu" olarak gösterilir.
+  internalCode        String?   @unique
+  costPrice           Decimal   @db.Decimal(12, 2)
+  price               Decimal   @db.Decimal(12, 2)
+  currency            String    @default("TRY")
+  taxRate             Decimal?  @db.Decimal(5, 2)
+  stock               Int       @default(0)
+  // Stok ilk 0'a düştüğü an (efektif stok=0). Stoğa dönünce null'lanır.
+  // stock-reconcile cron bakım yapar. Müşteri XML feed'i, bu tarih 3 günden
+  // eskiyse (yani ürün 3+ gündür 0 stoklu) ürünü ÇIKTIDAN eler — ölü ürünler
+  // entegratör feed'ini şişirmesin. Ürün silinmez, sadece XML'de görünmez.
+  outOfStockSince     DateTime?
+  active              Boolean   @default(true)
+  marketplaceListed   Boolean   @default(true)
+  // Kalıcı pasifleme — feed sync'ten BAĞIMSIZ. true ise ingest ürünü ASLA
+  // tekrar aktife çekmez (active & marketplaceListed daima false zorlanır),
+  // contentHash/stok/fiyat değişse bile. Görsel-kalitesi kuralı (≥5 üründe
+  // birebir aynı görsel / placeholder) ve elle "kalıcı gizle" bunu set eder.
+  // false (default) = active feed tarafından yönetilir (mevcut davranış).
+  // Admin elle aktife döndürmek isterse bu flag'i false yapar.
+  forceInactive       Boolean   @default(false)
+  // Admin elle override; null = feed yönetir. price/stock efektif değer kalır.
+  manualPrice         Decimal?  @db.Decimal(12, 2)
+  manualStock         Int?
+  // Sync'in en son XML'den hesapladığı ham değerler — temizleyince anında geri dönüş için.
+  feedPrice           Decimal?  @db.Decimal(12, 2)
+  feedStock           Int?
+  contentHash         String
+  lastSyncedAt        DateTime  @default(now())
+  createdAt           DateTime  @default(now())
+  updatedAt           DateTime  @updatedAt
+  // XML feed parça numarası (1-N). Append-only: bir kez atandıktan sonra
+  // asla değişmez. Yeni ürün ingest edildiğinde NULL olur, sonra recompute
+  // çağrısı boş slotlara dağıtır. Stok değişse de slot değişmez.
+  xmlPartIndex        Int?
+  // Parça içindeki sabit sıra. Backfill anında mevcut [stock DESC, id ASC]
+  // sırasıyla atanır; yeni ürünler her zaman max+1 alır (sona eklenir).
+  // XML feed sorgusu bu alanı orderBy olarak kullanır.
+  xmlSlotPosition     Int?
+  // V2 (marketplace) feed parça numarası (1-5). Part 1-4 = Trendyol kurallarına
+  // uyan ürünler, part 5 = kalan ürünler. xmlPartIndex'ten BAĞIMSIZ — legacy
+  // feed slotlarına dokunmaz. Append-only: bir kez atandıktan sonra değişmez.
+  xmlPartIndexV2      Int?
+  // V2 parça içindeki sabit sıra. Append-only, yeni ürünler max+1 alır.
+  xmlSlotPositionV2   Int?
+  // İçerik normalizasyonu tamamlandığında set edilir (Turkish title-case isim,
+  // Toptan Budur imzası, ÜRÜNLER ADET FİYATIDIR. dedup).
+  // Bir kez set edildikten sonra name/description/barcode/model sonsuza kadar
+  // dondurulur — ingest bir daha bu alanlara dokunamaz.
+  contentNormalizedAt DateTime?
+  // Dedup: aynı normalize edilmiş isimde birden fazla ürün varsa (farklı
+  // tedarikçilerde), yalnızca "kazanan" ürün isCanonical=true olur ve müşteri
+  // listelerinde görünür. Kazanan = önce stoktakiler, sonra en pahalı.
+  // ProductDedupService.recomputeCanonical() tarafından yönetilir. Migration
+  // ile gelen mevcut satırlar true olarak grandfather edilir, ilk recompute'a
+  // kadar hiçbir ürün gizlenmez.
+  isCanonical         Boolean   @default(true)
+  // ADMIN vitrin (ADDITIVE — müşteri davranışını ETKİLEMEZ): dedup grubunda/
+  // matchGroup'ta yalnızca EN UCUZ (stoklu) ürün isCheapestInGroup=true olur.
+  // Müşteri/pazaryeri DAİMA isCanonical (en pahalı) görür; ADMIN_DISCOUNT hesabı
+  // katalogda isCheapestInGroup=true filtreleyerek her eşleşen üründe TEK + EN UCUZ
+  // kartı görür (kullanıcı kararı 2026-06-29). ProductDedupService yönetir; default
+  // true → gruplanmamış/tekil ürün kendi en ucuzudur, ilk recompute'a kadar görünür.
+  isCheapestInGroup   Boolean   @default(true)
+  // Ürün dedup eşleştirme anahtarı: computeNameKey(name)
+  // (trim + whitespace tekille). Ingest, admin-products ve
+  // recomputeCanonical doldurur. NULL = henüz backfill edilmemiş eski satır;
+  // tüketiciler bu durumda computeNameKey(name) ile runtime hesaplar.
+  nameKey             String?
+  // V3 doğru-kategori sistemi (ADDITIVE). categoryId (tedarikçi kökenli, karışık)
+  // V1/V2 feed için DEĞİŞMEDEN kalır. canonicalCategoryPath = ürünün DOĞRU
+  // (Trendyol tabanlı) kategori yolu — mağaza gezinme, tedarikçi-ayarları kategori
+  // yönetimi ve admin bu alanı kullanır. Hızlı gruplama/gezinme için
+  // denormalize edilmiş kategori yoludur. Seed + ingest-time job doldurur.
+  canonicalCategoryPath String?
+  // Vitrin/Satın-Alma ayrımı (ADDITIVE): aynı fiziksel ürün birden fazla
+  // tedarikçide varsa ProductMatchGroup ile
+  // bağlanır. NULL = gruplanmamış (tekil ürün, mevcut davranış aynen). Grup
+  // varsa vitrin = group.displayProductId (en pahalı), satın-alma = grup içi
+  // en ucuz stoklu. Bkz. ProductMatchService / product-match-key.ts.
+  matchGroupId        String?
+
+  supplier       Supplier           @relation(fields: [supplierId], references: [id], onDelete: Cascade)
+  feed           SupplierFeed?      @relation(fields: [feedId], references: [id], onDelete: SetNull)
+  category       Category?          @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+  matchGroup     ProductMatchGroup? @relation("MatchGroupMembers", fields: [matchGroupId], references: [id], onDelete: SetNull)
+  images         ProductImage[]
+  orderItems     OrderItem[]
+  // pg_trgm GIN indexes for ILIKE search are managed via raw SQL migrations
+  // (name, brand, model, description, externalCode, publicBarcode, barcode).
+  // İlk kurulum: 20260511150000_add_pgtrgm_product_search_indexes.
+  // DİKKAT: 20260515000000_sync_schema_drift bu indeksleri DROP etti (drift
+  // schema.prisma'da GIN/trgm op'larını modelleyemediği için onları "fazlalık"
+  // sanıp düşürdü). 20260613xxxxxx_restore_product_trgm_indexes ile name/brand/
+  // externalCode/barcode/publicBarcode için yeniden kuruldu. Bunlar bilinçli
+  // olarak schema.prisma dışında — Prisma GIN/trgm op'larını native modelleyemez,
+  // bu yüzden @@index ile tanımlanamazlar (drift yine düşürürdü).
+
+  @@unique([tenantId, supplierId, externalCode])
+  @@unique([tenantId, slug])
+  @@index([tenantId, categoryId])
+  @@index([tenantId, brand])
+  @@index([tenantId, supplierId, sourceBrand])
+  @@index([tenantId, price])
+  @@index([tenantId, active])
+  @@index([tenantId, active, xmlPartIndex, xmlSlotPosition])
+  @@index([tenantId, active, xmlPartIndexV2, xmlSlotPositionV2])
+  @@index([tenantId, isCanonical, active])
+  @@index([tenantId, isCheapestInGroup, active])
+  @@index([tenantId, nameKey])
+  @@index([tenantId, canonicalCategoryPath])
+  @@index([tenantId, matchGroupId])
+  @@index([feedId])
+}
+
+/**
+ * Vitrin Tedarikçisi / Satın Alma Tedarikçisi ayrımı — çapraz-tedarikçi ürün
+ * eşleştirme grubu. Aynı fiziksel ürün birden fazla tedarikçide bulunduğunda
+ * (ör. iki farklı tedarikçide) tek bir grup altında toplanır.
+ *
+ *  - displayProductId = VİTRİN ürünü (en pahalı stoklu üye). Müşteri/XML/
+ *    pazaryeri yalnız bunu görür (ProductDedupService isCanonical=true bırakır).
+ *  - Satın alma = grup üyeleri (Product.matchGroupId = id) arasında en ucuz
+ *    stoklu üye.
+ *
+ * matchKey product-match-key.ts ile üretilir (barkod EAN köprüsü + model imzası).
+ * confidence='high' (EAN+isim) otomatik active; gerisi pending_review → admin
+ * onay kuyruğu. Tamamen additive; gruplanmamış ürünler mevcut nameKey dedup ile
+ * aynen yönetilir.
+ */
+model ProductMatchGroup {
+  id               String    @id @default(cuid())
+  tenantId         String
+  // product-match-key.ts matchKey() çıktısı: "${eanCore}|${signature}" ya da
+  // "name:${normName}". Aynı anahtar = aynı ürün adayı. Model imzası gömülü →
+  // aynı barkod farklı model birleşmez.
+  matchKey         String
+  // Vitrin (müşteriye gösterilen, en pahalı) üye Product.id.
+  displayProductId String
+  // high | medium_ean | medium_name | low_fuzzy
+  confidence       String    @default("medium_name")
+  // active (canlı) | pending_review (admin onayı bekler) | rejected
+  status           String    @default("pending_review")
+  // auto (eşleştirme servisi) | manual (admin elle bağladı)
+  source           String    @default("auto")
+  note             String?
+  reviewedByUserId String?
+  reviewedAt       DateTime?
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+
+  members Product[] @relation("MatchGroupMembers")
+
+  @@unique([tenantId, matchKey])
+  @@index([tenantId, status])
+  @@index([tenantId, displayProductId])
+}
+
+model ProductImage {
+  id        String   @id @default(cuid())
+  productId String
+  url       String
+  position  Int      @default(0)
+  createdAt DateTime @default(now())
+
+  product Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@index([productId])
+}
+
+model Order {
+  id                   String      @id @default(uuid())
+  tenantId             String
+  customerId           String?
+  status               OrderStatus @default(paid)
+  // total = subtotal + kdvAmount. Geriye dönük uyumluluk için tutuluyor.
+  total                Decimal     @db.Decimal(12, 2)
+  // Bayi indirimi uygulanmış birim fiyatlar üzerinden ürün toplamı (KDV hariç).
+  subtotal             Decimal?    @db.Decimal(12, 2)
+  // Subtotal'a uygulanan KDV tutarı (varsayılan oran %20).
+  kdvAmount            Decimal?    @db.Decimal(12, 2)
+  // KDV oranı (yüzde, ör. 20 = %20).
+  kdvRate              Int?        @default(20)
+  currency             String      @default("TRY")
+  // Müşteri-yüzlü kısa sipariş numarası (61xxxxxx). Postgres sequence
+  // ile artırılır. NOT NULL — order creation flow her zaman doldurur,
+  // eski kayıtlar backfill migration'ı ile dolduruldu.
+  humanOrderNo         String      @unique
+  // Pazaryeri kaynaklı siparişlerin kanal etiketi (trendyol/hepsiburada/...).
+  marketplace          String?
+  // Kargo şirketi adı (ör. yurtici, mng, aras).
+  cargoCompany         String?
+  // Kargo takip barkodu / takip numarası.
+  cargoBarcode         String?
+  // ─── Basit Kargo entegrasyonu ("Kendim İçin"/self siparişler) ─────────────
+  // Basit Kargo tarafındaki sipariş id'si (webhook eşleşmesi + idempotency).
+  // Dolu = etiket ÜRETİLDİ; paid-hook bu varsa yeniden POST YAPMAZ.
+  basitKargoOrderId    String?
+  // Basit Kargo durum snapshot'ı (NEW/READY_TO_SHIP/SHIPPED/... veya PENDING/FAILED).
+  // Retry cron barkodu henüz dolmamış (PENDING/FAILED) self siparişleri toplar.
+  basitKargoStatus     String?
+  // Tedarikçide oluşturulan sipariş numarası (sipariş bazında, tüm kalemleri kapsar).
+  // İlk kez set edildiğinde status='paid' → 'preparing' otomatik geçiş yapar.
+  // OrderItem.supplierOrderNo eski (per-item) alan; yeni kullanım sipariş bazında.
+  supplierOrderNo      String?
+  // Müşteri ismi — Bayi'nin KENDİ son müşterisi (sipariş başına farklıdır).
+  // Order.customerName teslimat/bayi adıdır; bu alan onunla karıştırılmaz.
+  endCustomerName      String?
+  // Ödeme tipi: 'card' (online), 'cari' (cariden ödeme).
+  paymentType          String?
+  // Kartlı ödemenin çekildiği sanal POS — PosProvider.key ('paytr' vb.).
+  // paymentType='card' tahsilatı gerçekleştiğinde set edilir; admin POS
+  // sayfasındaki sağlayıcı bazlı çekim istatistikleri bu alandan hesaplanır.
+  posProviderKey       String?
+  // Kart komisyonu SNAPSHOT'ı — sipariş anındaki PosProvider.customerCommissionRate.
+  // cardCommissionAmount = round2(total * rate/100), KDV DAHİL brüt tutardır.
+  // Karttan çekilen = total + cardCommissionAmount. İADE EDİLMEZ (PayTR işlem
+  // başına keser) — iptalde cariye total kadar iade edilir. Faturada ayrı kalem
+  // OLMAZ: KDV'siz karşılığı ürün matrahlarına oransal gömülür (pricing.engine).
+  cardCommissionRate   Decimal?    @db.Decimal(5, 2)
+  cardCommissionAmount Decimal?    @db.Decimal(12, 2)
+  // GERÇEK POS komisyonu SNAPSHOT'ı — kart tahsilatı 'paid'e dönerken (PayTR
+  // callback / confirmCardPayment) aktif PosProvider.commissionRate (POS'un
+  // BİZDEN kestiği gerçek oran, ~%2,79) yazılır.
+  //   cardCommissionAmountActual = round2(total * commissionRate / 100)  (KDV dahil)
+  // Komisyon KÂRI (muhasebe) = cardCommissionAmount (müşteriden alınan %3)
+  //   − cardCommissionAmountActual (POS'a ödenen ~%2,79). Eski siparişlerde
+  // null → merkezî kâr formülü mevcut aktif POS oranını fallback olarak kullanır
+  // (muhasebe.md kararı: "geçmiş kart komisyonu mevcut PosProvider.commissionRate ile").
+  cardCommissionRateActual   Decimal? @db.Decimal(5, 2)
+  cardCommissionAmountActual Decimal? @db.Decimal(12, 2)
+  // Cariden ödeme onay durumu: 'pending', 'approved', 'rejected'.
+  cariApprovalStatus   String?
+  // Bu siparişin ne kadarı PROMO (hoşgeldin) bakiyeden ödendi — KDV DAHİL brüt.
+  // Cariden ödemede promo-önce (FIFO) tüketilip snapshot'lanır. Bu kısım aylık
+  // ORTAK GİDERİ olarak muhasebeleşir ve faturaya GİRMEZ (Faz 2: pricing.engine).
+  promoBalanceApplied  Decimal     @default(0) @db.Decimal(12, 2)
+  // Tedarikçi tarafından zorunlu kılınmış sipariş PDF'i (proforma / imzalı onay).
+  // MinIO bucket: order-pdfs/{orderId}/<dosya>. Supplier.requiresPdf=true ise
+  // bu alan null olamaz (OrdersService.create 400 döner).
+  // pdfUrl: yüklendiği an üretilen 7-günlük signed URL (R2 SigV4 max).
+  // pdfKey: kalıcı object key; admin "Görüntüle" akışı bundan taze URL üretir.
+  pdfUrl               String?
+  pdfKey               String?
+  // 30 günlük R2 saklama süresi dolduğunda StorageRetentionService set eder;
+  // pdfKey/pdfUrl kayıt olarak kalır, signed URL üretilmez (404 yerine
+  // "süresi doldu" mesajı gösterilir).
+  pdfPurgedAt          DateTime?
+  customerName         String
+  customerEmail        String
+  customerPhone        String
+  addressLine1         String
+  addressCity          String
+  addressPostal        String
+  addressCountry       String      @default("TR")
+  trackingNumber       String?
+  notes                String?     @db.Text
+  // Auto-route (paid hook) hangi kurala göre hangi tedarikçiye çektiğini yazar
+  // (kılıf/cam/hafta sonu/fiyat eşiği). YALNIZ admin görür — müşteriye dönen
+  // select'lere ASLA eklenmez ([[customer-no-supplier-leak]] KESKİN KURAL).
+  dispatchRoutingNote  String?     @db.Text
+
+  // ─── Faturalandırma akışı (BirFatura) ────────────────────────────────────
+  // status='paid' transition'ında doldurulur. Sipariş 144h hold içinde iptal
+  // edilirse (kart) POS komisyonu kesilip kalan cari'ye iade edilir; hold
+  // sonrası BirFatura cron'u siparişi çekip e-fatura/e-arşiv keser.
+  paidAt           DateTime?
+  invoiceHoldUntil DateTime?
+  invoicedAt       DateTime? // /api/invoiceLinkUpdate callback set eder
+  billingHold      Boolean   @default(false) // manuel "fatura tutma" guard
+  billingNote      String?
+
+  // BirFatura'dan callback ile gelen fatura PDF bilgisi.
+  // Toplu (konsolide) modda batch faturalanınca üye order'lara propagate edilir.
+  invoiceUrl    String?
+  invoiceNumber String?
+  invoiceDate   DateTime?
+
+  // Konsolide fatura batch'i (BirFatura aylık toplu fatura). Dolu = bu sipariş
+  // bir InvoiceBatch'e donduruldu, artık tekrar faturalanmaz (§4 eligibility).
+  invoiceBatchId String?
+
+  // Billing snapshot — paid an'ında Customer'dan kopyalanır, sonradan
+  // Customer güncellense bile sipariş üstündeki billing değişmez.
+  billingName         String?
+  billingCompanyTitle String?
+  billingVergiNo      String?
+  billingVergiDairesi String?
+  billingTcNo         String?
+  billingEmail        String?
+  billingPhone        String?
+  billingMobilePhone  String?
+  billingAddressLine  String?
+  billingDistrict     String?
+  billingCity         String?
+  billingPostal       String?
+
+  // Shipping district (CustomerAddress.district'ten snapshot)
+  shippingDistrict String?
+
+  // Şu an yok ama ileride doldurulacak (kargo ücreti opsiyonu için hazır)
+  cargoCost Decimal? @db.Decimal(12, 2)
+
+  // Paketleme ücreti — birim başına alınır, sipariş anında snapshot'lanır.
+  // KDV-hariç; e-faturada ShippingCharge kalemine eklenir.
+  packagingCost    Decimal? @db.Decimal(12, 2)
+  packagingUnitFee Decimal? @db.Decimal(12, 2)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // ─── Tedarikçi status-poll bookkeeping ──────────────────────────────────
+  // status alanı değiştiği her transition'da güncellenir. Status-poll cron'u
+  // "preparing'e ne zaman geçti?" sorusunu cevaplamak için bu alana bakar
+  // (statusChangedAt + delayHours ≤ now). OrderTrackingEvent.some() sorgusu
+  // yerine tek sütun filtre = stabil performans + index-friendly.
+  statusChangedAt  DateTime?
+  // Status-poll processor son çağrıyı bittiğinde (başarı/başarısız fark etmez)
+  // bu alanı set eder. cooldownSec ile birlikte aynı siparişi tekrar tekrar
+  // sorgulamayı engeller. Geçişte (4=shipped) clear edilmez — yalnızca audit.
+  lastStatusPollAt DateTime?
+
+  // status → 'shipped' transition'ında set edilir (auto-ship, tedarikçi
+  // status-sync). Konsolide fatura uygunluğu
+  // (§4: shippedAt <= cutoff) bu alana bakar. statusChangedAt'tan ayrı tutulur
+  // ki sonraki bir status değişimi kargo tarihini bozmasın.
+  shippedAt DateTime?
+
+  // ─── Depo (house-stock) sipariş bayrakları ───────────────────
+  // En az bir kalemde houseStockReservedQty>0 olduğunda TRUE.
+  // Admin "Depo" sekmelerinin sorgusu bu bayrağı kullanır.
+  // Müşteri tarafına asla sızdırılmaz.
+  hasHouseStockItems     Boolean   @default(false)
+  // İlk Depo kalemi gönderildiğinde set edilir. Sipariş "Bekleyen" →
+  // "Kargoya Verilecek" listesine bu alan üzerinden geçer.
+  houseStockDispatchedAt DateTime?
+
+  tenant              Tenant                  @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  customer            Customer?               @relation(fields: [customerId], references: [id], onDelete: SetNull)
+  items               OrderItem[]
+  trackingEvents      OrderTrackingEvent[]
+  cariPayment         CariPayment?
+  cariLedgerEntries   CariLedger[]
+  supportMessages     SupportMessage[]
+  houseStockSalesLogs HouseStockSalesLog[]
+  invoiceBatch        InvoiceBatch?           @relation(fields: [invoiceBatchId], references: [id], onDelete: SetNull)
+  // ─── Tedarikçi Bakiye Senkronu — bu siparişe ait bakiye hareketleri ──────
+  supplierLedger      SupplierAccountLedger[] @relation("SupplierLedgerOrder")
+  // ─── Sanal POS işlem denemeleri (PayTR iFrame attempt + callback sonucu) ─
+  paymentTransactions PaymentTransaction[]
+  // ─── Kredi Kartı Tahsilat Makbuzu — yalnızca paymentType='card' siparişte ─
+  paymentReceipt      PaymentReceipt?
+
+  @@index([tenantId, status])
+  @@index([customerId])
+  // BirFatura `/api/orders/` filter performansı için kritik
+  @@index([status, paidAt])
+  @@index([invoicedAt])
+  // Konsolide fatura: batch üyesi siparişleri çekme + uygunluk (shipped+unbilled)
+  @@index([invoiceBatchId])
+  @@index([status, shippedAt, invoiceBatchId])
+  // Tedarikçi status-poll batch query: WHERE status='preparing' AND
+  // statusChangedAt <= cutoff AND (lastStatusPollAt IS NULL OR lastStatusPollAt <= cooldownCutoff)
+  @@index([status, statusChangedAt, lastStatusPollAt])
+  // Depo "Bekleyen" sekmesi sorgusu
+  @@index([tenantId, hasHouseStockItems, status])
+  // Basit Kargo webhook eşleşmesi (basitKargoOrderId ile order bulma)
+  @@index([basitKargoOrderId])
+}
+
+model OrderTrackingEvent {
+  id          String   @id @default(cuid())
+  orderId     String
+  status      String
+  description String?
+  location    String?
+  occurredAt  DateTime @default(now())
+
+  order Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@index([orderId])
+}
+
+enum InvoiceBatchStatus {
+  frozen
+  invoiced
+  cancelled
+}
+
+/// BirFatura aylık konsolide (toplu) fatura batch'i. Her ayın kesim gününde
+/// (varsayılan 25) kargolanmış (status='shipped') + henüz faturalanmamış
+/// siparişler bayi (customerId) + ödeme tipi (paymentType) bazında TEK batch'e
+/// dondurulur. BirFatura `/api/orders/`'tan tek sentetik sipariş olarak çekilir
+/// → bayiye tek e-fatura kesilir → `/api/invoiceLinkUpdate/` ile link geri döner.
+model InvoiceBatch {
+  id               String             @id @default(uuid())
+  tenantId         String
+  customerId       String // bayi
+  paymentType      String // 'cari' | 'card' — batch'te karışmaz (ayrı batch'ler)
+  periodStart      DateTime // önceki kesim (etiket)
+  periodEnd        DateTime // bu kesim = OrderDate (25'i / tetik tarihi)
+  // Sentetik OrderId — ayrı Postgres sequence (start 9_000_000_000) → 8 haneli
+  // humanOrderNo (61xxxxxx) ile asla çakışmaz, 2^53 altında (JS-safe).
+  birfaturaOrderId BigInt             @unique @default(dbgenerated("nextval('birfatura_order_id_seq'::regclass)"))
+  orderCode        String // üye sipariş no'ları virgülle birleşik ("AB-61000042, AB-61000043, …")
+  status           InvoiceBatchStatus @default(frozen)
+
+  // Billing snapshot (bayi) — donma anında Customer'dan kopyalanır; Customer
+  // sonradan değişse bile batch üstündeki billing değişmez.
+  billingName         String?
+  billingCompanyTitle String?
+  billingVergiNo      String?
+  billingVergiDairesi String?
+  billingTcNo         String?
+  billingEmail        String?
+  billingPhone        String?
+  billingMobilePhone  String?
+  billingAddressLine  String?
+  billingDistrict     String?
+  billingCity         String?
+  billingPostal       String?
+
+  // Tutar snapshot — donma anında §2 motoruyla hesaplanır, yuvarlanmadan saklanır.
+  productsTotalTaxExcluding Decimal @db.Decimal(14, 4)
+  productsTotalTaxIncluding Decimal @db.Decimal(14, 4)
+  totalPaidTaxExcluding     Decimal @db.Decimal(14, 4)
+  totalPaidTaxIncluding     Decimal @db.Decimal(14, 4)
+
+  // Kaynak ayrımı (ADDITIVE). 'order' (default) = normal konsolide sipariş
+  // batch'i (mevcut davranış — satırlar üye siparişlerden türetilir, DOKUNULMAZ).
+  // 'integration_package' = Entegrasyon paketi ödemesi: üye sipariş YOK,
+  // tek sentetik satır `lineDescription`'dan basılır (customer/admin/BirFatura
+  // mapper'ları source'a göre dallanır).
+  source               String  @default("order")
+  lineDescription      String? // paket batch'i sentetik fatura satırı adı
+
+  // /api/invoiceLinkUpdate callback ile dolar.
+  invoiceUrl    String?
+  invoiceNumber String?
+  invoiceDate   DateTime?
+  invoicedAt    DateTime?
+
+  frozenAt  DateTime?
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  customer Customer @relation(fields: [customerId], references: [id], onDelete: Restrict)
+  orders   Order[]
+
+  @@unique([customerId, paymentType, periodEnd]) // bayi + ödeme tipi + dönem → tek batch
+  @@index([status, periodEnd])
+}
+
+model Customer {
+  id                 String         @id @default(cuid())
+  email              String         @unique
+  passwordHash       String
+  // AES-256-GCM ile şifrelenmiş ham şifre. Sadece admin "şifre görüntüle"
+  // endpoint'i için saklanır. PASSWORD_VAULT_KEY ile çözülür ve audit log'a yazılır.
+  // Null ise admin yalnızca "force reset" yapabilir.
+  encryptedPassword  String?
+  name               String
+  phone              String?
+  birthDate          String?
+  language           String         @default("tr")
+  timezone           String         @default("Europe/Istanbul")
+  // Firma bilgileri
+  companyTitle       String?
+  // Türkiye vergi numarası — 10 hane (sadece rakam) ya da boş.
+  vergiNo            String?
+  // Vergi dairesi adı — serbest metin, opsiyonel.
+  vergiDairesi       String?
+  // TC kimlik numarası — bireysel müşteri (şahıs faturası) için. 11 hane.
+  // Boş ise BirFatura'ya 11111111111 fallback gönderilir (kurumsal varsay).
+  tcKimlik           String?
+  mersisNumber       String?
+  companyAddress     String?
+  // İletişim bilgileri (firma iletişim kişisi)
+  contactName        String?
+  contactPhone       String?
+  contactEmail       String?
+  // LEGACY "liste fiyatından indirim" (off-list). Satış = liste × (1 − %/100).
+  // Admin panelinde artık DÜZENLENMEZ (yalnız "Kâr İndirimi" girilir); mevcut
+  // müşterilerin fiyatları bozulmasın diye motor bunu hâlâ FALLBACK olarak
+  // uygular: profitDiscountPercent=0 iken bu oran devreye girer.
+  discountPercent    Int            @default(0)
+  // "Kâr İndirimi" (kardan indirim) — indirim ürünün KÂRINDAN yapılır, asla
+  // maliyetin altına inmez. Satış = maliyet + (liste − maliyet) × (1 − %/100).
+  // %100 ⇒ maliyet + paketleme (= Admin İndirimi). Global; tedarikçi-bazlı
+  // CustomerSupplierDiscount.profitDiscountPercent ile override edilir.
+  // >0 iken legacy discountPercent (off-list) yok sayılır.
+  profitDiscountPercent Int          @default(0)
+  // Müşteri statüsü. STANDARD = normal fiyatlandırma. ADMIN_DISCOUNT =
+  // admin müşterilerine maliyet (costPrice) fiyatından satış; paketleme
+  // ücreti yine uygulanır. Tüm tedarikçi/global iskontoları override eder.
+  customerStatus     CustomerStatus @default(STANDARD)
+  // Segment etiketi — admin toplu işlemlerde filtreleme için kullanılır.
+  // Örn: "vip", "yeni-bayi", "pasif-3-ay". Boş bırakılabilir.
+  segment            String?
+  // İÇ (house) HESAP: true ise bu müşterinin siparişlerde harcadığı
+  // promo/hediye bakiye finans panelinde "Promo/Hediye Bakiye" GİDERİ
+  // olarak SAYILMAZ (aylık + kümülatif + ortak API). Geçmiş ve gelecek
+  // tüm harcamaları kapsar. Şirketin kendi müşteri hesapları için.
+  promoExpenseExempt Boolean        @default(false)
+  // Müşterinin cari bakiyesi (TRY). Pozitif = kullanılabilir kredi.
+  // Atomik mutasyonlar için her zaman SELECT FOR UPDATE ile kilitlenir.
+  cariBalance        Decimal        @default(0) @db.Decimal(12, 2)
+  // LEGACY XML feed token. Yalnızca eski (v1) müşterilerde dolu. Yeni
+  // müşterilerde HİÇ üretilmez (null kalır) — entegrasyona verilmiş eski
+  // linkler bu token üzerinden legacy partition ile çalışmaya devam eder.
+  xmlToken           String?        @unique
+  // V2 (marketplace) XML feed token. TÜM müşterilerde dolu: eski müşterilere
+  // backfill + login'de ensureXmlTokenV2, yeni müşterilere kayıtta. Profil
+  // ekranında gösterilen 5 part link bu token ile üretilir.
+  xmlTokenV2         String?        @unique
+  // V3 (doğru-kategorili pazaryeri) XML feed token. ADDITIVE: V1/V2'den
+  // bağımsız. Yeni müşterilere kayıtta, mevcut müşterilere login'de eklenir.
+  // V3 feed 3 lehçe (trendyol/hepsiburada/pazarama) URL'de seçilir.
+  // xmlToken/xmlTokenV2'ye DOKUNMAZ.
+  xmlTokenV3         String?        @unique
+  mustChangePassword Boolean        @default(false)
+  // Şifre sıfırlama (forgot-password) token'ının SHA-256 hash'i. Ham token
+  // ASLA DB'ye yazılmaz — yalnız kullanıcının mailindeki sıfırlama linkinde
+  // taşınır. Reset uçları gelen token'ı sha256'layıp bu alanla eşler.
+  // Tek-kullanım: başarılı sıfırlamada null'lanır. Nullable @unique → Postgres
+  // birden çok NULL'a izin verir (token'ı olmayan tüm müşteriler).
+  passwordResetTokenHash String?    @unique
+  // Sıfırlama token'ının son geçerlilik anı (üretimde now + 5 dk). Bu andan
+  // sonra token reddedilir; sunucu-tarafı zorunlu kontrol.
+  passwordResetExpiresAt DateTime?
+  // Oturum sürümü — şifre her değiştiğinde (reset/self-change/admin) +1 artar.
+  // JWT payload'ındaki `ver` bu değerle eşleşmiyorsa CustomerJwtGuard 401 döner:
+  // şifre sıfırlama, önceden verilmiş tüm oturumları (7 gün) anında geçersizler
+  // (hesap-ele-geçirmeden kurtulma). Eski (ver'siz) token'lar ver=0 sayılır →
+  // default 0 ile eşleşir, deploy'da kimse düşmez.
+  tokenVersion       Int            @default(0)
+  profileCompleted   Boolean        @default(false)
+  isActive           Boolean        @default(true)
+  // Tatil modu: bayinin geçici olarak siparişe kapalı olduğunu işaretler
+  // (salt bilgi bayrağı — hiçbir iş mantığını tetiklemez).
+  vacationMode       Boolean        @default(false)
+  vacationStartedAt  DateTime?
+  // Konsolide fatura kesimi aç/kapat (admin müşteri detayından). Kapalıyken bu
+  // bayinin shipped siparişleri hiçbir InvoiceBatch'e alınmaz (§4 eligibility).
+  invoicingEnabled   Boolean        @default(true)
+  // Entegrasyon — pazaryeri-bazlı erişim (paket kademesiyle hizalı). Boş {}
+  // = eski davranış (marketplaceApiEnabled global belirler — geri uyum). Dolu ise
+  // { "TRENDYOL": true, "HEPSIBURADA": false, "PAZARAMA": true } ince kapı. Tek
+  // Pazaryeri paketi → seçilen 1 pazaryeri true; Tüm Pazaryerleri → 3'ü true.
+  // E-posta bildirim tercihleri (müşteri /hesabim/ayarlar > Bildirimler'den yönetir).
+  // İkisi de default açık → mevcut müşterilerin maili kesilmez. Yalnızca OPSİYONEL
+  // sipariş yaşam-döngüsü maillerini kapatır; iptal/iade, destek, mesaj, şifre,
+  // cari/ödeme, bayilik mailleri ZORUNLU ve bu bayraklardan etkilenmez.
+  orderConfirmEmailEnabled Boolean    @default(true) // "Siparişiniz alındı" onay maili
+  orderStatusEmailEnabled  Boolean    @default(true) // "hazırlanıyor / durum güncellendi" maili
+  // İnsan-okunur bayi numarası — makbuzdaki `{{BAYI_ID}}` (`BAYI-XXXXXX`).
+  // `bayi_no_seq` üzerinden atanır. GARANTİ: HER yeni müşteri insert anında
+  // otomatik numara alır — DB-seviyesi DEFAULT (dbgenerated) sayesinde, kod yolu
+  // ne olursa olsun (bayilik ön-kayıt/onay, admin, seed, raw SQL). Uygulama
+  // kodundaki BayiNumberService.ensureForCustomer bunu pekiştirir (idempotent;
+  // numara varsa sequence tüketmez). Geçmiş NULL kayıtlar
+  // 20260628150000_bayi_no_guarantee migration'ı ile kronolojik dolduruldu.
+  // Kolon NULLABLE bırakıldı — NOT NULL eklemek upsert.update yollarını riske
+  // atardı; pratikte DEFAULT + backfill ile NULL kalmaz. UNIQUE index çoklu
+  // NULL'a izin verir ve çakışmayı (tekrarlı numara) İMKANSIZ kılar.
+  bayiNo             String?        @unique @default(dbgenerated("('BAYI-'::text || lpad((nextval('bayi_no_seq'::regclass))::text, 6, '0'))"))
+  createdAt          DateTime       @default(now())
+  updatedAt          DateTime       @updatedAt
+
+  orders            Order[]
+  addresses         CustomerAddress[]
+  cariPayments      CariPayment[]
+  cariTopups        CariTopup[]
+  cariLedger        CariLedger[]
+  supportMessages   SupportMessage[]
+  supplierDiscounts CustomerSupplierDiscount[]
+  invoiceBatches    InvoiceBatch[]
+  paymentReceipts   PaymentReceipt[]
+  popupImpressions  PopupImpression[]
+  // YALNIZ ADMIN — müşteri panelinde ASLA gösterilmez (customer-no-supplier-leak
+  // ile aynı disiplin). Organizasyon/hatırlatma etiketleri (renkli); iskonto
+  // otomasyonu YOK, tamamen görsel.
+  tags                CustomerTag[]              @relation("CustomerTags")
+}
+
+/// Müşteri (bayi) organizasyon etiketi — YALNIZ ADMIN. Renkli, yeniden
+/// kullanılabilir; bir müşteride birden çok olabilir (m2m). Örn. "Rakip bayiden
+/// gelen", "Sadık müşteri", "Aranacak". Sadece görsel/hatırlatma — fiyat/iskontoya
+/// DOKUNMAZ. Müşteri-tarafı hiçbir sorguya eklenmez.
+model CustomerTag {
+  id        String     @id @default(cuid())
+  tenantId  String
+  name      String
+  color     String // hex, ör. "#e11d48"
+  createdAt DateTime   @default(now())
+  updatedAt DateTime   @updatedAt
+  customers Customer[] @relation("CustomerTags")
+
+  @@unique([tenantId, name])
+  @@index([tenantId])
+}
+
+model CustomerAddress {
+  id         String   @id @default(cuid())
+  customerId String
+  title      String
+  fullName   String
+  phone      String?
+  line1      String
+  line2      String?
+  city       String
+  district   String?
+  postalCode String?
+  country    String   @default("TR")
+  isDefault  Boolean  @default(false)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  customer Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+
+  @@index([customerId])
+  @@index([customerId, isDefault])
+}
+
+model DealerApplication {
+  id                  String   @id @default(cuid())
+  name                String
+  email               String   @unique
+  phone               String
+  company             String?
+  // Başvuru notu (serbest metin). Artık SADECE notlar; vergiNo/firma buraya
+  // birleştirilmez — her biri kendi kolonunda yapısal tutulur.
+  message             String?
+  // Vergi numarası — onayda Customer.vergiNo'ya kopyalanır.
+  vergiNo             String?
+  // Bayi başvurusunda alınan vergi dairesi adı.
+  // Onay sırasında Customer.vergiDairesi'ne kopyalanır.
+  vergiDairesi        String?
+  // Admin değerlendirme verisi (Customer'a TAŞINMAZ — karar (c)):
+  // seçilen paket + entegrasyon yazılımı kullanımı.
+  package             String?
+  hasIntegration      String?
+  integrationSoftware String?
+  status              String   @default("PENDING")
+  createdAt           DateTime @default(now())
+}
+
+model Dealer {
+  id        String   @id @default(cuid())
+  tenantId  String
+  name      String
+  email     String   @unique
+  phone     String?
+  company   String?
+  active    Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  tenant Tenant        @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId])
+}
+
+model CustomerSupplierDiscount {
+  id              String   @id @default(cuid())
+  customerId      String
+  supplierId      String
+  tenantId        String
+  // LEGACY off-list (liste fiyatından) indirim — bu tedarikçide. Admin panelinde
+  // artık düzenlenmez; motor profitDiscountPercent=0 iken FALLBACK olarak uygular
+  // (mevcut müşteri fiyatları bozulmasın). >0 iken profitDiscountPercent önceliklidir.
+  discountPercent Int      @default(0)
+  // "Kâr İndirimi" — bu tedarikçide kârdan indirim (0-100). Satış = maliyet +
+  // (liste − maliyet) × (1 − %/100). %100 ⇒ maliyet (adminDiscount ile aynı).
+  // >0 ise bu tedarikçide global ve legacy off-list yerine bu uygulanır.
+  profitDiscountPercent Int @default(0)
+  // Tedarikçi-bazlı Admin İndirimi: true ise bu (müşteri, tedarikçi) çifti için
+  // global ADMIN_DISCOUNT ile aynı davranış UYGULANIR ama YALNIZCA bu tedarikçide:
+  // ürünler maliyet (costPrice) fiyatından satılır (sıfır ürün kârı), müşteri
+  // yalnızca maliyet + KDV + paketleme (pricing.packagingUnitFee, default 4,80×adet)
+  // öder; admin net karı = paketleme ücreti. adminDiscount=true iken discountPercent
+  // yok sayılır (admin kazanır). Diğer tedarikçiler normal/yüzde fiyatla kalır.
+  adminDiscount   Boolean  @default(false)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  customer Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  supplier Supplier @relation(fields: [supplierId], references: [id], onDelete: Cascade)
+
+  @@unique([customerId, supplierId])
+  @@index([customerId])
+  @@index([supplierId])
+  @@index([tenantId])
+}
+
+/// Log kovası — Loglar sayfasında üç ayrı sekmede gruplanır:
+/// ADMIN    → admin/system kullanıcı aksiyonları (tedarikçi bakiye dahil)
+/// BIRFATURA→ BirFatura/fatura entegrasyonu olayları
+/// CUSTOMER → müşteri + anonim (public) form gönderimleri
+enum AuditLogCategory {
+  ADMIN
+  BIRFATURA
+  CUSTOMER
+}
+
+model AuditLog {
+  id          String           @id @default(cuid())
+  tenantId    String?
+  actorType   String
+  actorId     String?
+  action      String
+  target      String?
+  metadata    Json?
+  // Log kategorisi (kova). actorType korunur; bu alan UI sekme ayrımı içindir.
+  // Verilmezse audit.service actorType + action prefix'inden türetir.
+  logCategory AuditLogCategory @default(ADMIN)
+  createdAt   DateTime         @default(now())
+
+  @@index([tenantId, createdAt])
+  @@index([actorId, createdAt])
+  @@index([logCategory, createdAt])
+}
+
+model AuditLogSetting {
+  id        String   @id @default("default")
+  emails    String[]
+  updatedAt DateTime @updatedAt
+}
+
+/// Admin panelinden ("Ayarlar > Değişkenler") düzenlenen runtime config.
+/// Token gibi rotate-only secret'lar .env'de kalır; iş mantığı parametreleri
+/// (fatura bekleme süresi, POS komisyonu, vb.) burada tutulur.
+model AppSetting {
+  key         String   @id // "birfatura.invoiceHoldHours"
+  value       String // "144" — type'a göre AppSettingsService parse eder
+  type        String // 'number' | 'decimal' | 'boolean' | 'string'
+  category    String // 'birfatura' | 'payment' | ...
+  label       String // UI'da gösterilen başlık
+  description String?
+  minValue    Decimal? @db.Decimal(12, 4)
+  maxValue    Decimal? @db.Decimal(12, 4)
+  updatedAt   DateTime @updatedAt
+  updatedBy   String?
+
+  @@index([category])
+}
+
+/// VaultService ile AES-256-GCM şifrelenmiş secret'lar (BirFatura token, vb).
+/// AppSetting'den ayrı tutulur — runtime config DEĞİL, gerçek secret.
+model SecretSetting {
+  key         String   @id // "birfatura.apiToken"
+  sealedValue String // VaultService.seal(plaintext) çıktısı
+  label       String
+  description String?
+  updatedAt   DateTime @updatedAt
+  updatedBy   String?
+}
+
+model OrderItem {
+  id                      String   @id @default(uuid())
+  orderId                 String
+  // Tedarikçi hard-delete edilirse Product cascade siler ve bu FK SET NULL olur.
+  // Sipariş geçmişi denormalize edilen productSlug/productName/unitPrice alanlarıyla korunur.
+  productId               String?
+  productSlug             String
+  productName             String
+  // Birim fiyat = bayi indirimi uygulanmış fiyat (tutarın hesaplandığı değer).
+  // KDV hariç, müşteri sepette bu fiyatı görür.
+  unitPrice               Decimal  @db.Decimal(12, 2)
+  // Listelenen orijinal fiyat (indirim öncesi). Mevcut kayıtlarda boş olabilir.
+  unitPriceOriginal       Decimal? @db.Decimal(12, 2)
+  // Sipariş anındaki müşteri indirim yüzdesi (örn 50). 0 = indirim yok.
+  discountPercent         Int      @default(0)
+  qty                     Int
+  // Sipariş anındaki tedarikçi alış fiyatı snapshot'ı. Ürün sonradan değişse bile geçmiş karlılık doğru kalır.
+  costPriceSnapshot       Decimal? @db.Decimal(12, 4)
+  // Sipariş anındaki tedarikçi stok kodu (ham externalCode) snapshot'ı.
+  // YALNIZCA admin panelinde gösterilir — müşteriye asla sızdırılmaz.
+  supplierSku             String?
+  // Sipariş anındaki tedarikçi barkodu snapshot'ı.
+  // YALNIZCA admin panelinde gösterilir — müşteriye asla sızdırılmaz.
+  supplierBarcode         String?
+  // Bayinin gerçekte alım yaptığı tedarikçi (örn. "daha ucuz" önerisini kabul edip
+  // farklı tedarikçiden almışsa). Boşsa product.supplierId geçerlidir.
+  // Ciro/cari/alım analizleri bu alanı önceler.
+  supplierIdOverride      String?
+  // ─── Tedarikçi SNAPSHOT (hard-delete koruması) ──────────────────────────
+  // Sipariş anındaki tedarikçi kimliği/adı snapshot'ı. costPriceSnapshot ile
+  // AYNI amaç: ürün hard-delete edilse (productId → SET NULL) bile karlılık ve
+  // tedarikçi-cari raporları siparişi DOĞRU tedarikçiye atfeder; aksi halde
+  // silinen ürünler "Ürün Silinmiş"e düşüp tedarikçi kırılımını ve cari raporu
+  // bozar. FK kurulmaz (denormalize) — tedarikçi de silinse ad korunur.
+  // Çözümleme önceliği HER YERDE: supplierIdOverride → supplierIdSnapshot →
+  // product.supplierId. Snapshot, ürünün sonradan başka tedarikçiye taşınması
+  // durumunda da sipariş anındaki gerçek tedarikçiyi korur (tarihsel doğruluk).
+  supplierIdSnapshot      String?
+  supplierNameSnapshot    String?
+  // ─── MÜŞTERİ-YÜZLÜ stok kodu SNAPSHOT (hard-delete koruması) ─────────────
+  // Sipariş anındaki, müşteriye gösterilen kalıcı "Stok Kodu" (TBDR internalCode)
+  // ve public barkod snapshot'ı. supplierIdSnapshot/costPriceSnapshot ile AYNI
+  // koruma ama MÜŞTERİ tarafı: ürün hard-delete edilince (productId → SET NULL)
+  // bile e-faturada/panelde gösterilen Stok Kodu donmuş TBDR kodunu korur ve
+  // ASLA URL slug'ına (productSlug) düşmez. Tedarikçi snapshot'ından farklı
+  // olarak bu alanlar MÜŞTERİYE GÖSTERİLİR (slug/tedarikçi-kodu sızıntısını kapatır).
+  internalCodeSnapshot    String?
+  publicBarcodeSnapshot   String?
+  // Auto-route ile başka tedarikçiye yönlendirildiğinde, hedef tedarikçideki
+  // ürünün externalCode'u (SKU). Dispatch orchestrator bu varsa supplierSku
+  // yerine bunu kullanır. supplierSku orijinal snapshot olarak korunur.
+  supplierSkuOverride     String?
+  // Auto-route ile başka tedarikçiye yönlendirildiğinde, hedef tedarikçideki
+  // ürünün barkodu. Dispatch orchestrator bu varsa supplierBarcode yerine
+  // bunu kullanır.
+  supplierBarcodeOverride String?
+  // Bayinin tedarikçide oluşturduğu/aldığı sipariş numarası. Set edildiğinde
+  // sipariş durumu paid → preparing'e otomatik geçer.
+  supplierOrderNo         String?
+
+  // ─── Depo (house-stock) rezervasyon/dispatch alanları ─────────
+  // OWNER'ın evindeki HouseStockItem stoğundan rezerve edilen adet. >0 ise
+  // Tedarikçi dispatcher bu kalemi tedarikçiye GÖNDERMEZ (skip).
+  // Müşteri tarafına asla sızdırılmaz.
+  houseStockReservedQty        Int       @default(0)
+  // Rezervasyonun son geçerlilik anı — geçtiyse cron 03:00 release eder.
+  houseStockReservedUntil      DateTime?
+  // Rezervasyon hangi OWNER'a yazıldı — iki OWNER aynı TBDR'yi stoklarsa
+  // listelerde/badge'de doğru OWNER'a düşmesi için zorunlu.
+  houseStockReservedOwnerId    String?
+  // Rezervasyonun bağlandığı somut HouseStockItem — atomik release/dispatch
+  // için zorunlu. Item silinirse SET NULL ile orphan'a düşer.
+  houseStockItemId             String?
+  // OWNER "Depodan Gönder" dediği an. NULL iken hâlâ bekliyor.
+  houseStockDispatchedAt       DateTime?
+  // Dispatch'i yapan OWNER kullanıcısı (User.id).
+  houseStockDispatchedByUserId String?
+  // 'manual' (OWNER butonu) | 'auto' (ileride). Üye satır kaynak izini.
+  houseStockDispatchKind       String?
+
+  // ─── Bayiler-arası iade satışı (dealer-return fulfillment) ───────────────
+  // 'supplier'(default) = normal tedarikçi dropship akışı.
+  // 'dealer_return'     = bu kalem başka bir bayinin iade stoğundan alındı;
+  //   kargoyu SATICI bayi verir. Bu kalemi içeren sipariş tedarikçi dispatch
+  //   schedulerlarına, auto-ship'e ve XML feed'e ASLA girmez (ilgili WHERE
+  //   filtreleri bu alana bakar). Statüsü satıcının kargo girişiyle ilerler.
+  fulfillmentSource  String  @default("supplier")
+  // Kargoyu verecek satıcı bayi (Customer.id) — denormalize.
+  fulfillingDealerId String?
+
+  order                   Order           @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  product                 Product?        @relation(fields: [productId], references: [id], onDelete: SetNull)
+  supplierOverride        Supplier?       @relation("OrderItemSupplierOverride", fields: [supplierIdOverride], references: [id], onDelete: SetNull)
+  houseStockReservedOwner User?           @relation("OrderItemHouseStockOwner", fields: [houseStockReservedOwnerId], references: [id], onDelete: SetNull)
+  houseStockItem          HouseStockItem? @relation(fields: [houseStockItemId], references: [id], onDelete: SetNull)
+
+  @@index([orderId])
+  @@index([supplierIdOverride])
+  @@index([supplierIdSnapshot])
+  @@index([fulfillmentSource])
+  @@index([houseStockReservedUntil])
+  @@index([houseStockDispatchedAt])
+  @@index([houseStockReservedOwnerId])
+  @@index([houseStockItemId])
+}
+
+enum OrderStatus {
+  // Kartlı ödeme başlatıldı, POS callback'i bekleniyor. Callback 'success'
+  // dönünce 'paid'e geçer; başarısız denemede bu statüde kalır (retry edilebilir).
+  awaiting_payment
+  paid
+  preparing
+  shipped
+  cancelled
+  refunded
+}
+
+enum FormType {
+  CONTACT
+  APPLICATION
+  CALLBACK
+  // Entegrasyon paketi başvurusu (landing /entegrasyon/basvuru).
+  // Bayilik başvurusundan (APPLICATION) farklıdır: sözleşme onayı gerektirmez,
+  // otomatik DealerApplication/Customer ÜRETMEZ; bir satış lead'idir. Admin
+  // "Mesajlar & İstekler → Entegrasyon Başvurusu" sekmesinde ayrı görünür.
+  INTEGRATION
+}
+
+enum FormStatus {
+  NEW
+  HANDLED
+  ARCHIVED
+}
+
+model Form {
+  id                   String     @id @default(cuid())
+  type                 FormType
+  name                 String
+  email                String
+  phone                String
+  subject              String?
+  message              String     @db.Text
+  // Bayilik başvurusu (type=APPLICATION) yapısal alanları — artık message'a
+  // birleştirilmez; her biri kendi kolonunda tutulur ve admin'de alan-alan
+  // gösterilir, DealerApplication'a/Customer'a doğru eşlenir.
+  company              String?
+  vergiNo              String?
+  vergiDairesi         String?
+  integrationSoftware  String?
+  hasIntegration       String?
+  package              String?
+  // Bayilik başvurusu (type=APPLICATION) için sözleşme onayları. Üç sözleşme:
+  // (1) Bayilik ve Dropshipping, (2) Gizlilik ve KVKK, (3) Mesafeli Satış.
+  // Onay sırasında frontend tikleri server-side doğrulanır; geçerse onay anı +
+  // istemci IP'si kayıt altına alınır (hukuki delil zinciri).
+  contractDealershipAt DateTime?
+  contractPrivacyAt    DateTime?
+  contractDistanceAt   DateTime?
+  consentIp            String?
+  // Reklam atıf (attribution) alanları — "bu başvuru hangi reklamdan/kelimeden
+  // geldi?" (Google Ads URL son eki + gclid auto-tagging). Landing localStorage'da
+  // 90 gün saklar, form gönderiminde buraya yazılır. Admin Mesajlar detayında
+  // gösterilir. Tamamı nullable — organik başvurularda boş kalır.
+  utmSource            String?
+  utmMedium            String?
+  utmCampaign          String?
+  utmTerm              String?
+  utmContent           String?
+  gclid                String?
+  referrer             String?
+  landingPage          String?
+  status               FormStatus @default(NEW)
+  notes                String?    @db.Text
+  handledAt            DateTime?
+  createdAt            DateTime   @default(now())
+
+  @@index([type, status, createdAt])
+}
+
+enum SupportMessageStatus {
+  NEW
+  READ
+  REPLIED
+  ARCHIVED
+}
+
+/**
+ * İADE (return) talebi yaşam döngüsü — SADECE category='iade' taleplerinde dolu
+ * (iptal akışından ayrı). Akış: REQUESTED (müşteri açtı) → admin ya REJECTED
+ * (aksiyon yok) ya da APPROVED (adminden müşteriye iade adresi iletildi, mal
+ * bekleniyor) → mal ulaşıp admin onaylayınca FINALIZED (sipariş 'refunded' +
+ * cari iade).
+ */
+enum ReturnFlowStatus {
+  REQUESTED
+  APPROVED
+  // Müşteri ürünü kargoya verdiğini bildirdi (foto sohbette). Para HÂLÂ hareket
+  // etmez; iade ancak ürün elimize ulaşıp incelendikten sonra FINALIZED'da yapılır.
+  SHIPPED_BACK
+  REJECTED
+  FINALIZED
+}
+
+model SupportMessage {
+  id        String               @id @default(cuid())
+  name      String
+  email     String
+  subject   String?
+  body      String               @db.Text
+  status    SupportMessageStatus @default(NEW)
+  adminNote String?              @db.Text
+  ip        String?
+  userAgent String?              @db.Text
+  createdAt DateTime             @default(now())
+  updatedAt DateTime             @updatedAt
+
+  // Sipariş bağlantısı: müşteri panelinden sipariş kapsamında açılan
+  // talepler bu alanlarla işaretlenir. kind = "order" | "general".
+  customerId  String?
+  orderId     String?
+  orderNumber String?
+  kind        String? @default("general")
+  // Talep kategorisi: siparis, fatura, iade, teknik, odeme, urun, kargo, hesap, iptal
+  category    String?
+
+  // Kargo takip alanları (opsiyonel) — sipariş kapsamında açılan
+  // taleplerde müşteri doldurabilir.
+  marketplace  String?
+  carrier      String?
+  trackingCode String?
+
+  // ─── İADE (return) akışı — yalnız category='iade' taleplerinde dolu ──────
+  // returnStatus null = bu talep bir iade talebi değil (normal destek/iptal).
+  returnStatus          ReturnFlowStatus?
+  // Müşterinin yüklediği İADE FATURASI (yalnız sipariş faturalandıysa zorunlu).
+  // Özel (private) prefix: return-invoices/<ticketId>/<uuid>.pdf — public DEĞİL,
+  // yalnız imzalı URL ile erişilir. Key'i asla müşteriye/admin'e ham göndermeyiz.
+  returnInvoiceKey        String?
+  returnInvoiceName       String?
+  returnInvoiceUploadedAt DateTime?
+  // Admin onayında müşteriye iletilen iade adresinin kaydı (mesaj konuşmada da
+  // durur; burada iz için tutulur).
+  returnAddress   String?   @db.Text
+  returnDecidedAt   DateTime?
+  returnDecidedById String?
+  // Müşteri "Ürünü Kargoya Verdim" dediğinde damgalanır (APPROVED→SHIPPED_BACK).
+  returnShippedAt   DateTime?
+  returnFinalizedAt DateTime?
+
+  customer    Customer?                  @relation(fields: [customerId], references: [id], onDelete: SetNull)
+  order       Order?                     @relation(fields: [orderId], references: [id], onDelete: SetNull)
+  attachments SupportMessageAttachment[]
+
+  @@index([status, createdAt])
+  @@index([email])
+  @@index([customerId, createdAt])
+  @@index([orderId, createdAt])
+  @@index([kind, status, createdAt])
+}
+
+/**
+ * Müşteri tarafından destek talebine eklenen görsel/ek dosya. storageKey
+ * StorageService aracılığıyla erişilir; dosyanın fiziksel konumu (lokal disk
+ * vs Cloudflare R2) STORAGE_DRIVER env var ile belirlenir.
+ */
+model SupportMessageAttachment {
+  id         String    @id @default(cuid())
+  ticketId   String
+  storageKey String
+  filename   String
+  mimetype   String
+  size       Int
+  createdAt  DateTime  @default(now())
+  // 30 günlük R2 saklama süresi dolduğunda StorageRetentionService set eder.
+  // Set edildikten sonra signed URL üretilmez; UI "Görsel süresi doldu" rozeti
+  // gösterir. Satır izlenebilirlik için silinmez.
+  purgedAt   DateTime?
+
+  ticket SupportMessage @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+
+  @@index([ticketId])
+}
+
+/**
+ * Conversation — iki yüzeyde de kullanılan ortak, çift-yönlü (threaded) sohbet.
+ * SUPPORT             : bayi ↔ admin (SupportMessage ticket'ına bağlanır).
+ * DEALER_RETURN_ORDER : alıcı bayi ↔ satıcı bayi (iade satış siparişi içi).
+ * Admin her iki yüzeyde de TÜM içeriği görür.
+ * Bağlar (orderId/supportTicketId/buyer/seller) FK kurulmadan
+ * scalar tutulur — başka modellerin back-relation'larını değiştirmemek için.
+ * İsim maskeleme servis katmanında yapılır (bayiler birbirinin baş harflerini
+ * görür: "Ad Soyad" → "A.S."), bu modelde ham veri tutulur.
+ */
+model Conversation {
+  id               String           @id @default(uuid())
+  tenantId         String
+  type             ConversationType
+  // SUPPORT için dolu (1-1). Eski tek-gövdeli SupportMessage'a thread bağlar.
+  supportTicketId  String?          @unique
+  // DEALER_RETURN_ORDER için dolu.
+  orderId          String?
+  buyerCustomerId  String?
+  sellerCustomerId String?
+  // Son mesaj zamanı — admin/bayi listelerini sıralamak için.
+  lastMessageAt    DateTime?
+  createdAt        DateTime         @default(now())
+  updatedAt        DateTime         @updatedAt
+
+  messages ConversationMessage[]
+
+  @@index([tenantId, type, lastMessageAt])
+  @@index([orderId])
+  @@index([buyerCustomerId])
+  @@index([sellerCustomerId])
+}
+
+enum ConversationType {
+  SUPPORT
+  DEALER_RETURN_ORDER
+}
+
+enum ConversationSenderType {
+  CUSTOMER // SUPPORT yüzeyinde bayi
+  ADMIN
+  DEALER_BUYER // iade satış: alıcı bayi
+  DEALER_SELLER // iade satış: satıcı bayi
+}
+
+/**
+ * ConversationMessage — sohbetteki tek bir mesaj. Okunmamış takibi iki ayrı
+ * zaman damgasıyla yapılır: readByAdminAt (admin okudu mu) ve
+ * readByCounterpartyAt (karşı taraf okudu mu). Fotoğraf ekleri attachments[].
+ */
+model ConversationMessage {
+  id                   String                 @id @default(uuid())
+  conversationId       String
+  senderType           ConversationSenderType
+  // Gönderen bayi (Customer.id) ya da admin (User.id) — scalar, FK'siz.
+  senderCustomerId     String?
+  senderUserId         String?
+  body                 String                 @db.Text
+  readByAdminAt        DateTime?
+  readByCounterpartyAt DateTime?
+  createdAt            DateTime               @default(now())
+
+  conversation Conversation                    @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  attachments  ConversationMessageAttachment[]
+
+  @@index([conversationId, createdAt])
+}
+
+/**
+ * ConversationMessageAttachment — sohbet mesajına eklenen görsel.
+ * SupportMessageAttachment ile aynı StorageService deseni.
+ */
+model ConversationMessageAttachment {
+  id         String   @id @default(cuid())
+  messageId  String
+  storageKey String
+  filename   String
+  mimetype   String
+  size       Int
+  createdAt  DateTime @default(now())
+
+  message ConversationMessage @relation(fields: [messageId], references: [id], onDelete: Cascade)
+
+  @@index([messageId])
+}
+
+model Lead {
+  id        String   @id @default(cuid())
+  ad        String
+  telefon   String
+  eposta    String?
+  mesaj     String?
+  ip        String?
+  createdAt DateTime @default(now())
+
+  @@index([createdAt])
+}
+
+/**
+ * CariPayment — müşteri sipariş esnasında "cariden ödeme" seçtiğinde
+ * oluşan onay talebi. Admin onaylar/reddeder; karar Order.cariApprovalStatus
+ * alanına yansır. Bir siparişin yalnızca tek cari ödeme talebi olabilir.
+ */
+model CariPayment {
+  id              String    @id @default(uuid())
+  orderId         String    @unique
+  customerId      String
+  amount          Decimal   @db.Decimal(12, 2)
+  status          String    @default("pending")
+  requestedAt     DateTime  @default(now())
+  decidedAt       DateTime?
+  decidedByUserId String?
+  note            String?   @db.Text
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  order     Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  customer  Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  decidedBy User?    @relation("CariPaymentDecidedBy", fields: [decidedByUserId], references: [id], onDelete: SetNull)
+
+  @@index([customerId])
+  @@index([status, requestedAt])
+}
+
+enum CariTopupStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+enum CariLedgerType {
+  TOPUP
+  ORDER_PAYMENT
+  REFUND
+  ADJUSTMENT
+  // Bayiler-arası iade satışında, satıcı bayinin cari'sine geçen net tutar
+  // (satış bedeli − %10 platform komisyonu). Admin kargo onayında oluşur.
+  // Entegrasyon paket ücretinin cari bakiyeden otomatik tahsili (vade
+  // günü kart ödemesi yoksa). Negatif tutar (borç); cron tahsil eder.
+  INTEGRATION_PAYMENT
+}
+
+/**
+ * CariTopup — müşterinin cari bakiyesini yüklemek için yaptığı havale/EFT
+ * talebidir. Müşteri tutarı bildirir, banka açıklaması ekler; admin onaylar
+ * veya reddeder. Onayda atomik olarak Customer.cariBalance artar ve CariLedger
+ * kaydı oluşur. Idempotency: status='PENDING' iken tekrar karar verilemez.
+ */
+model CariTopup {
+  id               String          @id @default(uuid())
+  // İnsan-okunur talep numarası — `CXXXXXX` (C + 6 hane). Migration tarihinden
+  // önce oluşturulmuş eski kayıtlarda NULL kalır; yeni kayıtlarda
+  // `cari_topup_human_no_seq` üzerinden atanır. UNIQUE.
+  humanTopupNo     String?         @unique
+  customerId       String
+  // Yüklenmek istenen tutar (TRY) — CARİYE EKLENECEK net tutar.
+  amount           Decimal         @db.Decimal(12, 2)
+  // Yükleme yöntemi: 'bank_transfer' (havale/EFT, admin onaylı) |
+  // 'card' (PayTR, callback success'te SİSTEM otomatik onaylar).
+  method           String          @default("bank_transfer")
+  // Kart yönteminde: müşteriye yansıtılan komisyon (site oranı snapshot'ı)
+  // ve karttan çekilen toplam (= amount + commissionAmount). Komisyon
+  // CARİYE EKLENMEZ ve iade edilmez.
+  commissionRate   Decimal?        @db.Decimal(5, 2)
+  commissionAmount Decimal?        @db.Decimal(12, 2)
+  chargedAmount    Decimal?        @db.Decimal(12, 2)
+  status           CariTopupStatus @default(PENDING)
+  // Müşterinin havale yaptığı banka hesabı (varsa).
+  bankAccountId    String?
+  // Müşteri açıklaması (havale referansı, dekont notu vb.).
+  customerNote     String?         @db.Text
+  // Admin karar notu (red sebebi, bilgi notu).
+  adminNote        String?         @db.Text
+  requestedAt      DateTime        @default(now())
+  decidedAt        DateTime?
+  decidedByUserId  String?
+  createdAt        DateTime        @default(now())
+  updatedAt        DateTime        @updatedAt
+
+  customer            Customer             @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  bankAccount         BankAccount?         @relation(fields: [bankAccountId], references: [id], onDelete: SetNull)
+  decidedBy           User?                @relation("CariTopupDecidedBy", fields: [decidedByUserId], references: [id], onDelete: SetNull)
+  ledgerEntry         CariLedger?
+  // Kart yönteminde PayTR işlem denemeleri.
+  paymentTransactions PaymentTransaction[]
+  // ─── Kredi Kartı Tahsilat Makbuzu — yalnızca method='card' yüklemede ─────
+  paymentReceipt      PaymentReceipt?
+
+  @@index([customerId])
+  @@index([status, requestedAt])
+}
+
+/**
+ * CariLedger — cari bakiyenin değişim defteri. Her satır işaretli tutar
+ * (pozitif = alacak/kredi, negatif = borç/kullanım) ve işlem sonrası bakiye
+ * snapshot'u taşır. Aynı transaction içinde Customer.cariBalance ile birlikte
+ * yazılır. type ile kaynak ayrılır; topupId/orderId opsiyonel referans.
+ */
+model CariLedger {
+  id              String         @id @default(uuid())
+  customerId      String
+  type            CariLedgerType
+  // Pozitif (kredi) ya da negatif (borç) tutar. abs(amount) > 0.
+  amount          Decimal        @db.Decimal(12, 2)
+  // İşlem sonrası bakiye snapshot'u (audit için).
+  balanceAfter    Decimal        @db.Decimal(12, 2)
+  // İlgili topup talebi (TOPUP tipi için).
+  topupId         String?        @unique
+  // İlgili sipariş (ORDER_PAYMENT/REFUND tipi için).
+  orderId         String?
+  // Açıklama / not.
+  description     String?        @db.Text
+  // PROMO (hoşgeldin) kredisi mi? Açıklamada "HOS" işareti geçen manuel
+  // ADJUSTMENT'larda true. Promo havuzu = Σ(isPromo=true, amount>0). Bu kredinin
+  // harcanan kısmı ortak gideri olur ve faturaya girmez.
+  isPromo         Boolean        @default(false)
+  // HEDİYE BAKİYE mi? Admin'in müşteriye kampanya/jest olarak tanımladığı
+  // pozitif ADJUSTMENT'larda true. isPromo ile BİRLİKTE set edilir (hediye de
+  // firma-fonlu kredidir → promo havuzuna girer, harcanınca ortak gideri olur).
+  // isGift yalnızca GÖSTERİM/kampanya amaçlıdır: müşteri panelinde "HEDİYE
+  // BAKİYE" rozeti ve hareket defterinde ayrı etiket için kullanılır.
+  isGift          Boolean        @default(false)
+  // Manuel adjustment yapan kullanıcı (varsa).
+  createdByUserId String?
+  createdAt       DateTime       @default(now())
+
+  customer  Customer   @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  topup     CariTopup? @relation(fields: [topupId], references: [id], onDelete: SetNull)
+  order     Order?     @relation(fields: [orderId], references: [id], onDelete: SetNull)
+  createdBy User?      @relation("CariLedgerCreatedBy", fields: [createdByUserId], references: [id], onDelete: SetNull)
+
+  @@index([customerId, createdAt])
+  @@index([type, createdAt])
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+//  TEDARİKÇİ BAKİYE SENKRONU (Supplier Balance Sync)
+//
+//  Adminin tedarikçi sitelerindeki KENDİ cüzdan
+//  bakiyesini izleyen BAĞIMSIZ modül. KÂR/MALİYET (profitability, tedarikçi
+//  cari) modülleriyle HİÇBİR bağlantısı yoktur — ayrı tablo, ayrı route.
+//
+//  • Para girişi (TOPUP): admin tedarikçi sitesine para yatırınca MANUEL artar.
+//  • Para çıkışı (ORDER_PURCHASE): sipariş 'preparing'e geçtiği an, tedarikçinin
+//    yansıttığı GERÇEK tutar (supplierTotal) otomatik düşülür. costPrice tahmini
+//    YOK, KDV/ek-maliyet hesabı YOK.
+//  • İptal (ORDER_REFUND): sipariş iptalinde düşülen tutar geri eklenir.
+// ════════════════════════════════════════════════════════════════════════════
+
+/**
+ * SupplierLedgerType — tedarikçi bakiye defterinin işlem tipi.
+ */
+enum SupplierLedgerType {
+  MANUAL_SET // Admin bakiyeyi elle mutlak değere set etti.
+  TOPUP // Admin tedarikçi sitesine para yatırdı → bakiye artışı.
+  ORDER_PURCHASE // Sipariş preparing'e geçti → tedarikçinin yansıttığı gerçek tutar düşüldü.
+  ORDER_REFUND // Sipariş iptal → düşülen tutar geri eklendi.
+  ADJUSTMENT // Manuel düzeltme (+/-).
+}
+
+/**
+ * SupplierAccount — adminin bir tedarikçi sitesindeki KENDİ cüzdan bakiyesinin
+ * yerel kopyası. Tedarikçi başına tek kayıt (1:1). Para girişi manuel,
+ * para çıkışı sipariş preparing'e geçince otomatik düşülür.
+ */
+model SupplierAccount {
+  id                   String    @id @default(cuid())
+  tenantId             String
+  supplierId           String    @unique
+  // Tedarikçi sitesindeki güncel bakiye (TRY). Negatif olabilir (borç).
+  balance              Decimal   @default(0) @db.Decimal(12, 2)
+  // Düşük bakiye eşiği. Bakiye bunun altına inince admin bildirimi + mail.
+  threshold            Decimal   @default(1000) @db.Decimal(12, 2)
+  // Son düşük-bakiye bildiriminin gönderildiği an (cooldown için).
+  lowBalanceNotifiedAt DateTime?
+  createdAt            DateTime  @default(now())
+  updatedAt            DateTime  @updatedAt
+
+  tenant   Tenant                  @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  supplier Supplier                @relation(fields: [supplierId], references: [id], onDelete: Cascade)
+  ledger   SupplierAccountLedger[]
+
+  @@index([tenantId])
+}
+
+/**
+ * SupplierAccountLedger — tedarikçi bakiyesinin değişim defteri. Her satır
+ * işaretli tutar (pozitif = giriş, negatif = çıkış) ve işlem sonrası bakiye
+ * snapshot'u taşır. ORDER_PURCHASE/ORDER_REFUND idempotent:
+ * @@unique([orderId, supplierId, type]) — Postgres NULL orderId'leri çatıştırmaz,
+ * bu yüzden manuel kayıtlar (NULL orderId) sınırsız; sipariş kayıtları idempotent.
+ */
+model SupplierAccountLedger {
+  id              String             @id @default(cuid())
+  tenantId        String
+  supplierId      String
+  accountId       String
+  type            SupplierLedgerType
+  // İşaretli tutar: pozitif = giriş (topup/refund), negatif = çıkış (purchase).
+  amount          Decimal            @db.Decimal(12, 2)
+  // İşlem sonrası bakiye snapshot'u (audit için).
+  balanceAfter    Decimal            @db.Decimal(12, 2)
+  // İlgili sipariş (ORDER_PURCHASE/ORDER_REFUND için).
+  orderId         String?
+  // İnsan-okunur sipariş no snapshot'u (denormalize, gösterim için).
+  humanOrderNo    String?
+  description     String?            @db.Text
+  // Manuel işlemi yapan admin (varsa).
+  createdByUserId String?
+  createdAt       DateTime           @default(now())
+
+  tenant    Tenant          @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  supplier  Supplier        @relation(fields: [supplierId], references: [id], onDelete: Cascade)
+  account   SupplierAccount @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  order     Order?          @relation("SupplierLedgerOrder", fields: [orderId], references: [id], onDelete: SetNull)
+  createdBy User?           @relation("SupplierLedgerCreatedBy", fields: [createdByUserId], references: [id], onDelete: SetNull)
+
+  @@unique([orderId, supplierId, type])
+  @@index([supplierId, createdAt])
+  @@index([tenantId, createdAt])
+  @@index([type, createdAt])
+}
+
+/**
+ * BankAccount — admin tarafından tanımlanan, müşterilere gösterilecek
+ * banka havale bilgisi. Aktif kayıtlar müşteri "Cari Bakiye" sayfasında
+ * IBAN listesinde görünür. Tek tenant'lı kurulum; tenantId yok.
+ */
+model BankAccount {
+  id          String   @id @default(cuid())
+  bankName    String
+  accountName String
+  iban        String   @unique
+  // Şube kodu / hesap no (opsiyonel ek bilgi).
+  branchCode  String?
+  accountNo   String?
+  active      Boolean  @default(true)
+  // Sıralama (UI'da düşük → yüksek).
+  position    Int      @default(0)
+  // Açıklama notu (örn. "Yalnızca havale/EFT, ATM kabul etmez").
+  note        String?  @db.Text
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  topups CariTopup[]
+
+  @@index([active, position])
+}
+
+// ─── Sanal POS sağlayıcıları ────────────────────────────────────────────────
+// Admin "POS" sayfasından yönetilir. Aynı anda yalnızca BİR sağlayıcı aktif
+// olabilir (AdminPosService.activate transaction ile garanti eder). Kartlı
+// tahsilat gerçekleştiğinde Order.posProviderKey buradaki key'i işaret eder;
+// sağlayıcı bazlı çekim istatistikleri bu eşleşmeden hesaplanır. Müşteri
+// arayüzünde sağlayıcı adı ASLA gösterilmez — yalnızca kart logoları çıkar.
+model PosProvider {
+  id                     String   @id @default(cuid())
+  // Makine adı: 'paytr', 'garanti', 'param'... Order.posProviderKey buna bakar.
+  key                    String   @unique
+  name                   String
+  // Serbest not (örn. anlaşma tarihi, özel koşullar).
+  description            String?  @db.Text
+  active                 Boolean  @default(false)
+  // Anlaşma koşulları — admin POS sayfasında gösterilir/raporlanır.
+  // GERÇEK komisyon: POS'un BİZDEN kestiği oran (kâr hesapları için).
+  commissionRate         Decimal? @db.Decimal(5, 2) // % komisyon (örn. 3.00)
+  // SİTE komisyonu: MÜŞTERİYE yansıttığımız oran — sepet + cari yükleme
+  // hesapları bununla yapılır. Gerçek orandan farklı olabilir (kâr aracı).
+  customerCommissionRate Decimal? @db.Decimal(5, 2)
+  valorDays              Int? // valör: tahsilatın hesaba geçme süresi (gün)
+  // Sağlayıcı bazlı işlem ayarları (PayTR get-token parametreleri).
+  testMode               Boolean  @default(false) // canlıda test işlemi (test_mode=1)
+  noInstallment          Boolean  @default(false) // 1 → taksit seçenekleri gizlenir
+  maxInstallment         Int      @default(0) // 0 → yürürlükteki azami taksit
+  createdAt              DateTime @default(now())
+  updatedAt              DateTime @updatedAt
+
+  @@index([active])
+}
+
+// ─── POS işlem kayıtları ────────────────────────────────────────────────────
+// Her iFrame token isteği bir attempt (initiated) açar; PayTR Bildirim URL
+// callback'i sonucu success/failed'e çevirir. merchantOid PayTR'a giden
+// benzersiz sipariş referansıdır (alfanumerik, ≤64 karakter) — aynı siparişin
+// yeniden denemeleri yeni merchantOid ile yeni satır açar. Tekrarlanan
+// callback'ler merchantOid üzerinden idempotent ele alınır (PayTR 2. Adım).
+model PaymentTransaction {
+  id               String    @id @default(cuid())
+  tenantId         String
+  // İşlem türü: 'order' (sipariş ödemesi) | 'cari_topup' (karttan bakiye
+  // yükleme) | 'integration_package' (Entegrasyon paketi kart ödemesi).
+  kind             String    @default("order")
+  orderId          String?
+  topupId          String?
+  // kind='integration_package' için: ödeme onaylanınca paketi aktive edilecek
+  // müşteri (paket 1:1 müşteri ile; ayrı FK gerekmez, callback bununla çözer).
+  customerId       String?
+  providerKey      String // PosProvider.key ('paytr')
+  merchantOid      String    @unique
+  status           String    @default("initiated") // initiated | success | failed
+  // 1. Adım'da gönderilen tutar (TL) — kart komisyonu DAHİL çekilecek tutar.
+  // payment_amount = amount * 100 (kuruş).
+  amount           Decimal   @db.Decimal(12, 2)
+  // Callback'teki total_amount/100 — taksit vade farkı ile amount'tan yüksek olabilir.
+  totalAmount      Decimal?  @db.Decimal(12, 2)
+  currency         String    @default("TL")
+  paymentType      String? // callback payment_type: 'card' | 'eft'
+  failedReasonCode String?
+  failedReasonMsg  String?
+  testMode         Boolean   @default(false)
+  callbackAt       DateTime?
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+
+  order Order?     @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  topup CariTopup? @relation(fields: [topupId], references: [id], onDelete: Cascade)
+
+  @@index([orderId])
+  @@index([topupId])
+  @@index([customerId])
+  @@index([providerKey, status, createdAt])
+}
+
+/**
+ * PaymentReceipt — Kredi Kartı Tahsilat Makbuzu.
+ * EN ÖNEMLİ KURAL: makbuz YALNIZCA kredi kartı ile yapılan işlemlerde kesilir.
+ * - Sipariş (paymentType='card')           → kind='order',      orderId dolu
+ * - Cari bakiye yükleme (method='card')     → kind='cari_topup', topupId dolu
+ * Havale/EFT ve cariden ödeme → makbuz HİÇ üretilmez (kayıt da oluşmaz).
+ * Makbuz numarası kredi kartı işlemi ONAYLANDIĞI an, ilgili transaction'ın
+ * İÇİNDE atomik olarak üretilir (race-free, `makbuz_no_seq`). Format:
+ * `MBZ-{YIL}-{6 hane}` (ör. MBZ-2026-000123). Sipariş ve cari makbuzları TEK
+ * ortak seri kullanır (README önerisi — sürekli artan global seri).
+ * PDF lazy üretilir: ilk "Görüntüle/İndir" isteğinde Puppeteer ile render
+ * edilip object storage'a (MinIO/R2) yazılır, pdfKey/pdfUrl kaydedilir. Order
+ * pdf pattern'i ile aynı (pdfPurgedAt retention için).
+ * Snapshot alanları (bayiAdi/bayiId/kartSahibi/tutar/aciklama) makbuz anında
+ * dondurulur — Customer/Order sonradan değişse bile makbuz değişmez (yasal
+ * belge mantığı, Order billing snapshot ile aynı felsefe).
+ */
+model PaymentReceipt {
+  id             String    @id @default(cuid())
+  tenantId       String
+  // İnsan-okunur makbuz numarası — `MBZ-{YIL}-{6 hane}`. UNIQUE, kesin artan.
+  humanReceiptNo String    @unique
+  // İşlem türü: 'order' (sipariş ödemesi) | 'cari_topup' (kart bakiye yükleme).
+  kind           String
+  // İlişkili işlem — kind'a göre tam biri dolu, diğeri NULL. UNIQUE: bir
+  // sipariş/yükleme için en fazla bir makbuz (idempotent backfill güvencesi).
+  orderId        String?   @unique
+  topupId        String?   @unique
+  customerId     String
+  // Karttan çekilen toplam tutar (TUTAR token'ı). Sipariş = total + kart
+  // komisyonu; cari = chargedAmount. PaymentTransaction.totalAmount kaynaklı.
+  amount         Decimal   @db.Decimal(12, 2)
+  // Çekimin yapıldığı sanal POS (PosProvider.key) — audit/raporlama.
+  posProviderKey String?
+  // ─── Makbuz anı snapshot'ları (token değerleri) ──────────────────────────
+  // {{BAYI_ADI}} — Customer.companyTitle ?? name.
+  bayiAdi        String
+  // {{BAYI_ID}} — Customer.bayiNo (BAYI-XXXXXX).
+  bayiId         String
+  // {{KART_SAHIBI}} — Customer.companyTitle ?? name (firma adı; karar locked).
+  kartSahibi     String
+  // {{ACIKLAMA}} — README sabit metni (sipariş/cari varyantı).
+  aciklama       String    @db.Text
+  // {{DURUM}} — her zaman 'Onaylandı' (makbuz yalnız onaylı işlemde kesilir).
+  durum          String    @default("Onaylandı")
+  // {{TARIH}}/{{SAAT}} bu alandan türetilir — işlemin onay anı.
+  issuedAt       DateTime  @default(now())
+  // ─── PDF cache (Order pdf pattern) ───────────────────────────────────────
+  pdfUrl         String?
+  pdfKey         String?
+  pdfPurgedAt    DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  tenant   Tenant     @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  customer Customer   @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  order    Order?     @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  topup    CariTopup? @relation(fields: [topupId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId, kind, issuedAt])
+  @@index([customerId, issuedAt])
+  @@index([issuedAt])
+}
+
+// Admin login için 4 haneli OTP — geçerlilik süresi dolunca kullanılamaz.
+model AdminOtp {
+  id         String    @id @default(cuid())
+  userId     String
+  codeHash   String
+  otpSession String    @unique
+  expiresAt  DateTime
+  usedAt     DateTime?
+  attempts   Int       @default(0)
+  createdAt  DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+// "Beni hatırla" seçilince oluşturulan 30 günlük güvenilir cihaz kaydı.
+model AdminTrustedDevice {
+  id        String   @id @default(cuid())
+  userId    String
+  tokenHash String   @unique
+  userAgent String?
+  ip        String?
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+// NOT: ProfitabilityConfig modeli kaldırıldı. Tedarikçi alış/KDV/indirim ayarları
+// TEK KAYNAK olarak Supplier'a taşındı (purchaseVatRate, purchaseDiscountInclVatPct,
+// purchaseDiscountTl). Veri migration ile taşındı; bkz. ilgili migration.
+
+/// Admin bildirim merkezi — her bildirim bir admin/role'e gönderilir.
+/// SSE stream'i ile push'lanır; opsiyonel olarak web-push subscription'lara
+/// browser notification olarak da yollanır.
+model Notification {
+  id        String    @id @default(cuid())
+  // Hedef: belirli bir kullanıcı (userId) veya tüm OWNER+ADMIN'ler (userId null + role "ADMIN")
+  userId    String?
+  role      String? // "OWNER" | "ADMIN" — userId null ise bu rol filtresi kullanılır
+  type      String // "order.new" | "refund.requested" | "lead.new" | "stock.low" | "support.message" | "system"
+  severity  String    @default("info") // "info" | "success" | "warning" | "error"
+  title     String
+  body      String    @db.Text
+  link      String? // /orders/:id gibi admin app içi route
+  data      Json? // Tip-spesifik extra payload (orderId, leadId, vb.)
+  readAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  @@index([userId, readAt, createdAt])
+  @@index([role, readAt, createdAt])
+  @@index([type, createdAt])
+}
+
+/// Browser Push API subscription — bir admin tarayıcısı için VAPID public key
+/// ile subscribe olunan endpoint. Admin oturumu olsa bile push gönderiminde
+/// kullanılır.
+model PushSubscription {
+  id        String   @id @default(cuid())
+  userId    String
+  endpoint  String   @unique @db.Text
+  p256dh    String   @db.Text
+  auth      String   @db.Text
+  userAgent String?
+  createdAt DateTime @default(now())
+  lastUsed  DateTime @default(now())
+
+  @@index([userId])
+}
+
+/// Kullanıcı başına bildirim tercih ayarı — hangi tip bildirimleri SSE/push/email
+/// ile alacağını belirler. Eksik tip için default değer "in_app".
+model NotificationPreference {
+  userId    String
+  type      String // Notification.type ile aynı
+  channels  String[] // ["in_app", "push", "email"]
+  updatedAt DateTime @updatedAt
+
+  @@id([userId, type])
+}
+
+/// Zamanlanmış rapor — cron pattern'e göre belirli alıcılara PDF/Excel olarak
+/// email atılır. ReportSchedulerService process boot'unda DB'yi okuyup
+/// dinamik cron job'lar register eder; değişiklik olduğunda reload eder.
+model ReportSchedule {
+  id         String    @id @default(cuid())
+  name       String
+  reportType String // "monthly_sales" | "dealer_performance" | "inventory_value" | "supplier_profit"
+  format     String    @default("pdf") // "pdf" | "xlsx"
+  // 6 alan cron pattern (saniye dahil — node-cron formatı)
+  cron       String
+  // Email alıcı listesi (virgül ile değil, array)
+  recipients String[]
+  enabled    Boolean   @default(true)
+  // Rapor builder'a aktarılacak parametreler (örn. {period: "last_30_days"})
+  params     Json?
+  lastRunAt  DateTime?
+  lastStatus String? // "success" | "failed"
+  lastError  String?   @db.Text
+  createdBy  String?
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+
+  @@index([enabled])
+  @@index([reportType])
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// DEPO (Faz 1.7) — OWNER'ların ev stoğu
+// ═══════════════════════════════════════════════════════════════════════════
+// Sadece OWNER role'lü kullanıcılar HouseStockItem sahibi olabilir. Bu stok
+// XML feed'e, Trendyol/Hepsiburada listing'lerine veya müşteri tarafına ASLA
+// görünmez — yalnızca paid Order geldiğinde kalem bazında rezerve edilir.
+// Tatil mode FORWARD-ONLY: ON yapılması mevcut reservedQty>0 kalemleri salmaz.
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// OWNER'ın evinde fiziksel olarak bulunan ürün stoğu. TBDR kodu ile
+/// eşleştirilir; sipariş paid olduğunda yeterli stok varsa kalem
+/// houseStockReservedQty üzerine rezerve edilir, OrderItem dispatcher'a
+/// gitmez. OWNER buradan "Depodan Gönder" diyene kadar müşteri standart
+/// "Hazırlanıyor" durumunu görür — sızdırma yok.
+model HouseStockItem {
+  id           String   @id @default(cuid())
+  /// Sahibi (yalnızca OWNER role'lü User).
+  ownerId      String
+  /// Tedarikçi-agnostic eşleştirme: Product.tbdrCode ile match.
+  /// İki OWNER aynı TBDR için ayrı kayıt tutar (ev başına).
+  tbdrCode     String
+  /// Snapshot — admin UI'da hızlı render için (Product.name değişirse stale
+  /// olabilir, OWNER yenileme butonu ile güncelleyebilir).
+  productName  String?
+  productImage String?
+  /// Toplam fiziksel stok (rezerve edilmemiş + rezerve). Eksiye düşemez.
+  stockQty     Int      @default(0)
+  /// Şu an için rezerve edilmiş (paid orderItem'lara bağlı) toplam.
+  /// stockQty - reservedQty = serbest stok.
+  reservedQty  Int      @default(0)
+  /// OWNER tarafından eklenen kısa not (örn. "raf B3").
+  note         String?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  owner      User        @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  /// Bu HouseStockItem'a bağlı rezervasyonlar (Phase 4 reserve, Phase 6 dispatch).
+  orderItems OrderItem[]
+
+  /// Bir OWNER bir TBDR için tek satır tutar.
+  @@unique([ownerId, tbdrCode])
+  @@index([tbdrCode])
+  @@index([ownerId, stockQty])
+}
+
+/// OWNER başına Depo ayarları. Şimdilik tek alan: tatil modu.
+/// Tatil ON iken YENİ paid Order'lar rezervasyon yapmaz (tedarikçiye gider);
+/// mevcut reservedQty>0 kalemler etkilenmez — OWNER yine kargolar.
+model HouseStockSettings {
+  id           String    @id @default(cuid())
+  ownerId      String    @unique
+  vacationMode Boolean   @default(false)
+  /// Tatil modunun ne zaman açıldığı (audit).
+  vacationOnAt DateTime?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  owner User @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+}
+
+/// "Depodan Gönder" anında satış log'u — cari mekanizması YOK, yalnızca
+/// rapor amaçlı toplam/aylık satış sayacı. Order.totalAmount referans alınır.
+model HouseStockSalesLog {
+  id           String   @id @default(cuid())
+  ownerId      String
+  orderId      String
+  /// OrderItem.totalPrice toplamı (sadece bu Depo kalemleri için).
+  /// Müşteri'nin ödediği KDV-dahil tutar.
+  amount       Decimal  @db.Decimal(12, 2)
+  /// Bu sipariş içindeki Depo kalemlerinin toplam adedi.
+  quantity     Int
+  /// Dispatch anı.
+  dispatchedAt DateTime @default(now())
+
+  owner User  @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  order Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@index([ownerId, dispatchedAt])
+  @@index([orderId])
+}
+
+/// Pop-up / duyuru konumu — müşteri ekranında nerede belireceği.
+enum PopupPosition {
+  CENTER
+  TOP
+  BOTTOM
+  TOP_LEFT
+  TOP_RIGHT
+  BOTTOM_LEFT
+  BOTTOM_RIGHT
+}
+
+/// Pop-up boyutu — müşteri tarafındaki kartın genişlik sınıfı.
+enum PopupSize {
+  SMALL
+  MEDIUM
+  LARGE
+}
+
+/// Gösterim sıklığı kuralı.
+///  - ONCE: bir kez gösterilir, kapatılınca/görülünce bir daha gösterilmez.
+///  - EVERY_LOGIN: her gün ilk girişte yeniden gösterilir (günde 1).
+///  - LIMITED: en fazla `showLimit` kez gösterilir.
+enum PopupFrequency {
+  ONCE
+  EVERY_LOGIN
+  LIMITED
+}
+
+/// Hedef kitle.
+///  - ALL: tüm müşteriler.
+///  - SEGMENT: `segment` etiketi eşleşen müşteriler (sektör numarası vb.).
+///  - SPECIFIC: `customerIds` listesindeki müşteriler.
+enum PopupAudience {
+  ALL
+  SEGMENT
+  SPECIFIC
+}
+
+/// Admin panelinden yönetilen müşteri pop-up'ları / duyuruları. Hedefleme
+/// (tüm / segment / seçili müşteri), konum, boyut, gösterim sıklığı, tarih
+/// aralığı, CTA linki ve görsel buradan ayarlanır. Müşteri tarafı yalnız
+/// görünür/zamanı gelmiş kayıtları okur; gösterim sayacı PopupImpression'da
+/// sunucu tarafında tutulur (localStorage YASAK).
+model Popup {
+  id          String         @id @default(cuid())
+  tenantId    String
+  /// Legacy/basit mod başlığı. Blok modunda (content dolu) null olabilir —
+  /// görsel/video-only duyuruda başlık/metin zorunlu değildir.
+  title       String?
+  /// Legacy/basit mod gövdesi (düz metin). Blok modunda null olabilir.
+  body        String?        @db.Text
+  /// Görsel blok düzenleyici içeriği — bloklar dizisi (bkz. popup-content.ts).
+  /// Dolu ise müşteri/preview blokları render eder ve legacy title/body/image/
+  /// cta alanlarını YOK SAYAR. Null/boş = legacy basit mod.
+  content     Json?
+  /// Bu pop-up için yüklenmiş TÜM storage medya anahtarları (görsel + video,
+  /// bloklar içinde). Kaydetmede kullanılmayanlar silinir; süre bitince / kayıt
+  /// silinince hepsi storage'dan temizlenir (orphan medya bırakmaz).
+  mediaKeys   String[]       @default([])
+  /// Süre bitince medya temizlik cron'u storage'dan medyayı sildiğinde damgalanır.
+  mediaPurgedAt DateTime?
+  /// Durable public görsel URL'i (`/api/storage-public/popups/...`). Null =
+  /// görselsiz duyuru. (Legacy basit mod görseli.)
+  imageUrl    String?
+  /// Storage anahtarı (`popups/<uuid>.<ext>`) — görsel silindiğinde kullanılır.
+  imageKey    String?
+  ctaLabel    String?
+  ctaUrl      String?
+  ctaNewTab   Boolean        @default(true)
+  position    PopupPosition  @default(CENTER)
+  size        PopupSize      @default(MEDIUM)
+  /// Özel genişlik (px). Null = `size` ön ayarını kullan. Serbest tasarım/video
+  /// için ölçü bir standarta bağlı kalmaz.
+  widthPx     Int?
+  /// Pop-up kartı arka plan rengi (hex). Null = beyaz.
+  backgroundColor String?
+  frequency   PopupFrequency @default(ONCE)
+  /// LIMITED için üst sınır (1..100). Diğer frequency'lerde yok sayılır.
+  showLimit   Int            @default(1)
+  /// Müşteri kapatabilir mi (X butonu). false = zorunlu duyuru.
+  dismissible Boolean        @default(true)
+  audience    PopupAudience  @default(ALL)
+  /// SEGMENT hedeflemede eşleşecek segment etiketi (Customer.segment).
+  segment     String?
+  /// SPECIFIC hedeflemede hedef müşteri id listesi.
+  customerIds String[]       @default([])
+  /// Görünürlük penceresi. Null = sınırsız (her zaman / hemen).
+  startsAt    DateTime?
+  endsAt      DateTime?
+  isActive    Boolean        @default(true)
+  /// Yüksek öncelik önce gösterilir (aynı anda birden çok uygunsa).
+  priority    Int            @default(0)
+  /// İsteğe bağlı vurgu rengi (hex). Beyaz tema ile uyumlu aksan.
+  themeColor  String?
+  createdById String?
+  createdAt   DateTime       @default(now())
+  updatedAt   DateTime       @updatedAt
+
+  impressions PopupImpression[]
+
+  @@index([tenantId, isActive])
+  @@index([tenantId, startsAt, endsAt])
+}
+
+/// Müşteri × pop-up gösterim kaydı. Sıklık sınırlaması (ONCE / LIMITED /
+/// EVERY_LOGIN) ve "kapatıldı/tıklandı" durumları sunucu tarafında burada
+/// tutulur — tarayıcı storage'ına güvenilmez.
+model PopupImpression {
+  id          String   @id @default(cuid())
+  popupId     String
+  customerId  String
+  seenCount   Int      @default(0)
+  dismissed   Boolean  @default(false)
+  clicked     Boolean  @default(false)
+  firstSeenAt DateTime @default(now())
+  lastSeenAt  DateTime @default(now())
+
+  popup    Popup    @relation(fields: [popupId], references: [id], onDelete: Cascade)
+  customer Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+
+  @@unique([popupId, customerId])
+  @@index([customerId])
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Aylık Finans ve Ortak Dağılım Paneli (sayfa anahtarı: muhasebe_kar_dagilimi)
+//
+// İki gelir kolu tek panelde:
+//   • "Toptan Budur"        → profitability motorundan OTOMATİK (gelen/giden/kâr/KDV)
+//   • "Entegrasyon" → ELLE girilen gelir/gider satırları (aşağıdaki tablo)
+// Ortakların ödediği işletme masrafları
+// mahsuplaşır; net kâr − KDV farkı = dağıtılabilir bakiye, %pay + dengeleme ile
+// iki ortağa bölünür. Para alanları DAİMA Decimal(12,2). Ay = "YYYY-MM" metni.
+// ════════════════════════════════════════════════════════════════════════════
+
+enum FinanceExpenseKind {
+  RECURRING // Aylık sürekli gider (template'ten her ay otomatik düşer)
+  ONE_TIME // Tek seferlik / ilk kurulum gideri (yalnız girildiği ay)
+}
+
+enum FinanceExpenseStatus {
+  PAID // Ödendi
+  UNPAID // Ödenmedi (bekleyen)
+}
+
+enum FinanceEntryType {
+  INCOME // Gelir
+  EXPENSE // Gider
+}
+
+/// Ortak tanımı (dağılım yüzdesi + avatar). Lazy olarak 2 ortak tohumlanır.
+model FinancePartner {
+  id           String   @id @default(cuid())
+  tenantId     String
+  name         String
+  initials     String? // avatar baş harfleri ("O1", "O2")
+  colorHex     String? // avatar rengi
+  sharePercent Decimal  @default(50) @db.Decimal(5, 2) // dağılım payı %
+  isActive     Boolean  @default(true)
+  sortOrder    Int      @default(0)
+  // Finans API erişimi: bu ortağı temsil eden admin kullanıcı hesabı. Ortak
+  // kendi "Hesabım" sayfasından yalnız KENDİ finans serisini çeken bir GET-only
+  // API anahtarı üretir. NULL = henüz bir kullanıcıya bağlanmamış ortak.
+  userId       String?  @unique
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  tenant           Tenant                   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  user             User?                    @relation("FinancePartnerUser", fields: [userId], references: [id], onDelete: SetNull)
+  expenses         FinanceExpense[]
+  expenseTemplates FinanceExpenseTemplate[]
+  advances         FinancePartnerAdvance[]
+  apiKeys          FinancePartnerApiKey[]
+
+  @@index([tenantId])
+}
+
+/// Ortak Finans API anahtarı — bir FinancePartner'a bağlı, GET-only dış erişim.
+/// Ortak kendi "Hesabım" sayfasından üretir; token AES-256-GCM ile şifreli
+/// saklanır (sahibine tekrar gösterilebilsin) + auth için sha256 hash indexlenir.
+model FinancePartnerApiKey {
+  id              String    @id @default(cuid())
+  tenantId        String // denormalize (FK'siz) — tenant filtresi kolaylığı için
+  partnerId       String
+  tokenHash       String    @unique // sha256(token) hex — O(1) auth lookup
+  tokenPrefix     String // ilk 12 karakter — panelde maskeli gösterim
+  tokenSealed     String    @db.Text // VaultService.seal(token) — sahibine reveal
+  label           String? // opsiyonel etiket
+  createdByUserId String?
+  lastUsedAt      DateTime?
+  lastUsedIp      String?
+  requestCount    Int       @default(0)
+  revokedAt       DateTime?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  partner FinancePartner @relation(fields: [partnerId], references: [id], onDelete: Cascade)
+
+  @@index([partnerId])
+  @@index([tenantId])
+}
+
+/// Sürekli gider tanımı — "bir kez tanımla, her ay otomatik gelsin".
+model FinanceExpenseTemplate {
+  id              String   @id @default(cuid())
+  tenantId        String
+  category        String // "Yapay Zeka / API", "Sunucu", "Reklam", ...
+  description     String // "OpenAI API kullanımı"
+  amount          Decimal  @db.Decimal(12, 2)
+  kdvRate         Int      @default(20)
+  paidByPartnerId String? // varsayılan ödeyen ortak
+  isActive        Boolean  @default(true)
+  startMonth      String // "YYYY-MM" — bu aydan itibaren geçerli
+  endMonth        String? // "YYYY-MM" — dahil; null = süresiz
+  createdByUserId String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  tenant        Tenant           @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  paidByPartner FinancePartner?  @relation(fields: [paidByPartnerId], references: [id], onDelete: SetNull)
+  expenses      FinanceExpense[]
+
+  @@index([tenantId, isActive])
+}
+
+/// Aya düşen gider satırı (sürekli template'ten materyalize VEYA tek seferlik).
+/// Sürekli olanlar okuma anında lazy materyalize edilir → @@unique idempotency.
+model FinanceExpense {
+  id              String               @id @default(cuid())
+  tenantId        String
+  month           String // "YYYY-MM"
+  kind            FinanceExpenseKind   @default(ONE_TIME)
+  templateId      String? // sürekli ise kaynağı; tek seferlikte null
+  category        String
+  description     String
+  amount          Decimal              @db.Decimal(12, 2)
+  kdvRate         Int                  @default(20)
+  status          FinanceExpenseStatus @default(PAID) // Durum: Ödendi/Ödenmedi
+  paidByPartnerId String? // Ödeyen
+  enabled         Boolean              @default(true) // o ay için aç/kapa (sürekli)
+  note            String?              @db.Text
+  createdByUserId String?
+  createdAt       DateTime             @default(now())
+  updatedAt       DateTime             @updatedAt
+
+  tenant        Tenant                  @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  template      FinanceExpenseTemplate? @relation(fields: [templateId], references: [id], onDelete: SetNull)
+  paidByPartner FinancePartner?         @relation(fields: [paidByPartnerId], references: [id], onDelete: SetNull)
+
+  // Postgres'te NULL'lar farklı sayılır → tek seferlikler (templateId=null)
+  // çakışmaz; sürekli materyalizasyon (tenant,month,template) idempotenttir.
+  @@unique([tenantId, month, templateId])
+  @@index([tenantId, month])
+}
+
+/// Entegrasyon elle gelir/gider satırı (sağ panelden girilir).
+/// Tutar KDV-DAHİL kaydedilir; KDV payı rate/(100+rate) ile ayrılır.
+model FinanceIntegrationEntry {
+  id              String           @id @default(cuid())
+  tenantId        String
+  month           String // "YYYY-MM" (entryDate'ten türetilir)
+  entryDate       DateTime
+  type            FinanceEntryType
+  description     String
+  amount          Decimal          @db.Decimal(12, 2) // KDV DAHİL
+  kdvRate         Int              @default(20)
+  category        String?
+  createdByUserId String?
+  createdAt       DateTime         @default(now())
+  updatedAt       DateTime         @updatedAt
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId, month])
+}
+
+/// Kâr Avansı — bir ortağın işletmeden çektiği para (ortak cari hesabı borcu).
+/// Ortak Net + KDV'li bakiyesinden düşülür. `grossAmount` = KDV'li (fiziksel
+/// nakit çıkan), `netAmount` = net bakiyeden düşülecek (varsayılan grossAmount÷1,20).
+/// Tarih-bazlı: `advanceDate`'ten itibaren ileriye kümülatif olarak taşınır.
+model FinancePartnerAdvance {
+  id              String   @id @default(cuid())
+  tenantId        String
+  partnerId       String
+  advanceDate     DateTime
+  month           String // "YYYY-MM" — advanceDate'ten TR takvimiyle türetilir
+  grossAmount     Decimal  @db.Decimal(12, 2) // KDV'li — KDV'li bakiyeden düşülür
+  netAmount       Decimal  @db.Decimal(12, 2) // Net bakiyeden düşülür
+  description     String?
+  createdByUserId String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  tenant  Tenant         @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  partner FinancePartner @relation(fields: [partnerId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId, partnerId])
+  @@index([tenantId, month])
+}
+
+// ============================================================================
+// KARŞILAŞTIRMALAR MODÜLÜ (2026-07-26) — rakip/tedarikçi XML'leri ile fiyat
+// karşılaştırma + insan-onaylı ürün eşleştirme. TAMAMEN ADDITIVE: mevcut hiçbir
+// modele dokunmaz; Product/Customer/Tenant'a FK zorlanmaz (denormalize — kod tabanı
+// deseni). ProductMatchGroup (ürün dedup/auto-alım) ile İLGİSİZ, ayrı iştir.
+// ============================================================================
+
+model Competitor {
+  id                      String    @id @default(cuid())
+  tenantId                String
+  name                    String
+  // "competitor" = satış kıyası (insan-onaylı eşleştirme) ·
+  // "supplier"   = maliyet kıyası (OTOMATİK; onay kuyruğuna GİRMEZ, kendi içinde)
+  type                    String    @default("competitor")
+  feedUrl                 String?
+  priceKdvIncluded        Boolean   @default(true)
+  purchaseDiscountPercent Int       @default(0)
+  packagingFee            Decimal?  @db.Decimal(10, 2)
+  isDealerPrice           Boolean   @default(false) // bayi-fiyatlı feed işareti
+  fieldMap                Json? // {name,price,barcode,image,stock} → XML tag eşlemesi
+  cleanupWords            Json? // önek/kelime temizleme kuralları: ["Firma Adı®","®"]
+  active                  Boolean   @default(true)
+  lastSyncedAt            DateTime?
+  createdAt               DateTime  @default(now())
+  updatedAt               DateTime  @updatedAt
+
+  products CompetitorProduct[]
+
+  @@index([tenantId])
+}
+
+model CompetitorProduct {
+  id             String   @id @default(cuid())
+  tenantId       String
+  competitorId   String
+  externalCode   String // rakip productCode/barkod — feed yenilenince SABİT anahtar
+  name           String
+  normalizedName String? // temizlik (cleanupWords) sonrası ad → eşleştirmede kullanılır
+  price          Decimal  @db.Decimal(12, 2)
+  imageUrl       String?
+  productUrl     String? // rakip ürün sayfası (feed link/url) — isme tıklayınca açılır
+  barcode        String?
+  stock          Int      @default(0)
+  active         Boolean  @default(true)
+  lastSeenAt     DateTime @default(now())
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  competitor Competitor        @relation(fields: [competitorId], references: [id], onDelete: Cascade)
+  matches    CompetitorMatch[]
+
+  @@unique([competitorId, externalCode])
+  @@index([tenantId])
+  @@index([competitorId])
+  @@index([barcode])
+}
+
+model CompetitorMatch {
+  id                  String    @id @default(cuid())
+  tenantId            String
+  competitorProductId String
+  productId           String // bizim Product.id — DENORMALIZE; FK zorlanmaz (izolasyon)
+  status              String    @default("pending") // pending | auto | approved | rejected
+  confidence          Int       @default(0)
+  matchedBy           String? // ean | name | prefix | manual
+  decidedByUserId     String?
+  decidedAt           DateTime?
+  createdAt           DateTime  @default(now())
+  updatedAt           DateTime  @updatedAt
+
+  competitorProduct CompetitorProduct @relation(fields: [competitorProductId], references: [id], onDelete: Cascade)
+
+  @@unique([competitorProductId, productId]) // çoka-çok serbest; aynı çift tekrarlanmaz
+  @@index([tenantId])
+  @@index([productId])
+  @@index([status])
+}
+
+/// "Daha ucuz tedarikçi" MANUEL işareti — Yeni Tedarikçi Analizi'nde "Geçiş Yap"a
+/// basınca oluşur. Siparişler admin ekranında ilgili üründe uyarı etiketi çıkarır.
+/// SADECE hatırlatma; hiçbir otomasyon/tedarikçi değişimi YAPMAZ.
+model CheaperSupplierHint {
+  id              String   @id @default(cuid())
+  tenantId        String
+  productId       String // bizim ürün
+  supplierName    String // aday tedarikçi adı (ör. "Tahtakale Toptan")
+  competitorId    String? // kaynak aday Competitor id
+  theirCost       Decimal  @db.Decimal(12, 2) // aday net maliyet
+  ourCost         Decimal  @db.Decimal(12, 2) // bizim (en ucuz) maliyet
+  savingPerUnit   Decimal  @db.Decimal(12, 2) // ourCost - theirCost
+  productUrl      String? // aday tedarikçi ürün linki
+  createdByUserId String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@unique([tenantId, productId]) // ürün başına tek aktif işaret (son kazanır)
+  @@index([tenantId])
+  @@index([productId])
+}

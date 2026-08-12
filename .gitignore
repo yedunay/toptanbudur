@@ -1,0 +1,97 @@
+# Dependencies
+node_modules/
+.pnp
+.pnp.js
+.yarn/install-state.gz
+
+# Env / secrets
+.env
+.env.*
+!.env.example
+!.env.*.example
+
+# Build outputs
+.next/
+out/
+dist/
+build/
+*.tsbuildinfo
+next-env.d.ts
+apps/backend/prisma/generated/
+**/generated/prisma/
+
+# Cache
+.cache/
+.turbo/
+.parcel-cache/
+.eslintcache
+.stylelintcache
+.swc/
+.vite/
+.rollup.cache/
+.nx/cache/
+.pnpm-store/
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# Test / coverage
+coverage/
+.nyc_output/
+playwright-report/
+test-results/
+playwright/.cache/
+
+# IDE / OS
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+*.swp
+*.swo
+
+# Claude / agent state
+.claude/
+.claude-plugins/
+*.jsonl
+CODE_REVIEW_REPORT.md
+
+# Temp
+tmp/
+temp/
+*.tmp
+
+# Local infra
+docker-data/
+postgres-data/
+redis-data/
+minio-data/
+infra/*.env
+!infra/*.env.example
+*.bak
+
+# Reference scrapes (large HTML dumps)
+reference_site.html
+Ref_Site/
+
+# Large media (videos)
+*.mp4
+*.mov
+*.avi
+
+# XML feeds (regenerated)
+*.feed.xml
+
+# Misc
+template.md
+
+# Compose dosyaları repoda kalmalı (deploy için)
+!docker-compose.yml
+!docker-compose.*.yml

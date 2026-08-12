@@ -1,0 +1,303 @@
+@import "tailwindcss";
+
+/* ==========================================================================
+   ████  TOPTANBUDUR — TASARIM TOKEN BLOĞU  ████
+   ⚠️  BU BLOK İKİ APP'TE SENKRON TUTULMALI  ⚠️
+       apps/frontend/app/globals.css   ←→   apps/admin/src/index.css
+       (SYNC BAŞLANGIÇ ... SYNC BİTİŞ işaretleri arası birebir aynı olacak.)
+
+   İki app ayrı Docker imajı olarak build ediliyor; ortak bir CSS dosyası
+   import edilemiyor. Bu yüzden blok KOPYALANIR. Birinde değişiklik yapan
+   diğerine de aynısını uygular.
+
+   Kaynak: _plan/DESIGN-SPEC-V2.md §1 (renk) · §2.1 (font) · §3.2-3.6
+           (radii / gölge / kenarlık / focus / hareket)
+
+   `@theme static` bilinçli: tüm token'lar kullanılmasa bile :root'a basılır.
+   Kod tabanında token'lar çoğunlukla `text-[var(--color-...)]` biçiminde
+   arbitrary value olarak tüketiliyor; Tailwind bunları "kullanılıyor" saymaz
+   ve `static` olmadan değişkeni ağaçtan budayabilir.
+   ========================================================================== */
+/* ─────────────────────────── SYNC BAŞLANGIÇ ─────────────────────────── */
+
+@theme static {
+  /* ── MARKA · Navy (imza) ─ navy-700 markanın kendisi ────────────────── */
+  --color-navy-50: #f0effb;
+  --color-navy-100: #dedcf6;
+  --color-navy-200: #bfbbec;
+  --color-navy-300: #9791de;
+  --color-navy-400: #6c63c9;
+  --color-navy-500: #453bae;
+  --color-navy-600: #2a1f8c;
+  --color-navy-700: #110b6b; /* ★ MARKA — primary buton, başlık, logo */
+  --color-navy-800: #0c0850;
+  --color-navy-900: #070536;
+  --color-navy-950: #04031f;
+
+  /* ── AKSAN · Cyan (logo tekerlekleri) ───────────────────────────────────
+     KURAL: cyan BEYAZ ZEMİNDE metin/ikon olarak KULLANILMAZ (1.55:1).
+     Beyaz zeminde aksan metin → cyan-700 (4.9:1) / cyan-800 (7.1:1).
+     Cyan'ın doğal yeri navy zemindir (#00E5E5 on #110B6B = 10.1:1).
+     NOT: cyan-950 Tailwind varsayılanında kalır; marka ölçeği 50–900. */
+  --color-cyan-50: #e6fdfd;
+  --color-cyan-100: #c2fafa;
+  --color-cyan-200: #8af4f4;
+  --color-cyan-300: #3feded;
+  --color-cyan-400: #00e5e5; /* ★ AKSAN */
+  --color-cyan-500: #00c2c2;
+  --color-cyan-600: #009b9c;
+  --color-cyan-700: #067a7b;
+  --color-cyan-800: #0b6162;
+  --color-cyan-900: #0e5051;
+
+  /* ── NÖTR · Ink (hafif mavi kaçışlı — "premium" his buradan gelir) ──── */
+  --color-ink-25: #fafbfd;
+  --color-ink-50: #f4f6fa;
+  --color-ink-100: #ebeef4;
+  --color-ink-200: #dde2ec; /* ★ varsayılan kenarlık */
+  --color-ink-300: #c6cddb;
+  --color-ink-400: #94a0b8;
+  --color-ink-500: #5f6b85; /* ★ ikincil metin (AA 5.3:1) */
+  --color-ink-600: #47536b;
+  --color-ink-700: #343e52; /* ★ gövde metni */
+  --color-ink-800: #232b3a; /* ★ ana gövde / güçlü başlık */
+  --color-ink-900: #141a24;
+
+  /* ── SEMANTİK ────────────────────────────────────────────────────────
+     Soft rozet: bg-{sem}-50 + text-{sem}-700 + border-{sem}-100
+     Solid buton: bg-{sem}-600, hover bg-{sem}-700 */
+  --color-success-50: #ecfdf3;
+  --color-success-100: #d1fadf;
+  --color-success-500: #12b76a;
+  --color-success-600: #039855;
+  --color-success-700: #027a48;
+
+  --color-warning-50: #fffaeb;
+  --color-warning-100: #fef0c7;
+  --color-warning-500: #f79009;
+  --color-warning-600: #dc6803;
+  --color-warning-700: #b54708;
+
+  --color-danger-50: #fef3f2;
+  --color-danger-100: #fee4e2;
+  --color-danger-500: #f04438;
+  --color-danger-600: #d92d20;
+  --color-danger-700: #b42318;
+
+  --color-info-50: #eff8ff;
+  --color-info-100: #d1e9ff;
+  --color-info-500: #2e90fa;
+  --color-info-600: #1570ef;
+  --color-info-700: #175cd3;
+
+  /* ── ROL TOKEN'LARI (bileşenler bunları tercih etsin) ───────────────── */
+  --color-bg-page: #ffffff;
+  --color-bg-subtle: var(--color-ink-25);
+  --color-bg-muted: var(--color-ink-50);
+  --color-surface: #ffffff;
+  --color-surface-inverse: var(--color-navy-700);
+  --color-fg: var(--color-ink-800);
+  --color-fg-strong: var(--color-ink-900);
+  --color-fg-muted: var(--color-ink-500);
+  --color-fg-hint: var(--color-ink-400);
+  --color-fg-brand: var(--color-navy-700);
+  --color-fg-on-dark: #ffffff;
+  --color-fg-on-dark-muted: rgba(255, 255, 255, 0.68);
+  --color-border: var(--color-ink-200);
+  --color-border-subtle: var(--color-ink-100);
+  --color-border-strong: var(--color-ink-300);
+  --color-border-brand: var(--color-navy-700);
+  --color-border-on-dark: rgba(255, 255, 255, 0.14);
+  --color-ring: rgba(0, 229, 229, 0.45);
+  --color-overlay: rgba(7, 5, 54, 0.55);
+
+  /* ── GERİYE UYUMLULUK ALIAS'LARI — SİLİNMEYECEK ──────────────────────
+     Repoda ~2500 kullanım var (çoğu `bg-[var(--color-…)]` arbitrary value).
+     Yeni skalaya bağlandılar; bileşenler tek tek yeni token'lara taşınacak.
+
+     ⚠️ brand-blue / brand-navy eşlemesi bilinçli olarak SPEC'TEN AYRILIYOR:
+     Kod tabanında `bg-[var(--…brand-blue)] hover:bg-[var(--…brand-navy)]`
+     kalıbı düzinelerce yerde var. İkisi de #110B6B olsaydı hover geri
+     bildirimi sessizce kaybolurdu. Bu yüzden:
+        brand-blue → navy-700 (#110B6B, rest)   ← MARKA rengi buraya düştü
+        brand-navy → navy-800 (#0C0850, hover)
+     Sonuç DESIGN-SPEC-V2 §4.4 primary buton tanımının birebir aynısı. */
+  --color-brand-navy: var(--color-navy-800);
+  --color-brand-blue: var(--color-navy-700);
+  --color-primary: var(--color-navy-700); /* admin'de tanımsızdı → görsel bug */
+  --color-surface-muted: var(--color-ink-50);
+  --color-text: var(--color-ink-800);
+  --color-text-primary: var(--color-ink-900); /* admin'de tanımsızdı */
+  --color-text-muted: var(--color-ink-500);
+
+  /* ── TİPOGRAFİ (§2.1) ────────────────────────────────────────────────
+     --font-sans-var / --font-display-var next/font tarafından <html>'e
+     basılacak. Henüz bağlı değil → fallback sistem fontu devrede.
+     TODO(başka ajan) storefront: apps/frontend/app/layout.tsx → next/font/google
+       Plus_Jakarta_Sans({variable:"--font-display-var"}) + Inter({variable:
+       "--font-sans-var"}), subsets ["latin","latin-ext"], <html> class'ına ekle.
+     TODO(başka ajan) admin: apps/admin/index.html → Google Fonts <link> +
+       <html style="--font-sans-var:'Inter';--font-display-var:'Plus Jakarta Sans'">
+       (veya :root'a app-özel blokta yaz). */
+  --font-sans: var(--font-sans-var, ui-sans-serif), system-ui, -apple-system,
+    "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --font-display: var(--font-display-var, var(--font-sans-var, ui-sans-serif)),
+    system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial,
+    sans-serif;
+  --font-mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas,
+    monospace;
+
+  /* ── RADII (§3.2) — Tailwind varsayılanlarının üzerine yazar ───────── */
+  --radius-xs: 4px;
+  --radius-sm: 6px;
+  --radius-md: 8px; /* buton, input, select, dropdown item, tooltip */
+  --radius-lg: 12px; /* kart, dropdown paneli, tablo konteyneri, alert */
+  --radius-xl: 16px; /* ürün kartı, KPI tile, panel */
+  --radius-2xl: 24px; /* modal, hero kart, promo bant */
+  --radius-3xl: 32px;
+  --radius-full: 9999px;
+
+  /* ── GÖLGELER (§3.3) — navy tonlu, nötr siyah KULLANILMAZ ──────────── */
+  --shadow-xs: 0 1px 2px 0 rgba(17, 11, 107, 0.06);
+  --shadow-sm: 0 1px 3px 0 rgba(17, 11, 107, 0.08),
+    0 1px 2px -1px rgba(17, 11, 107, 0.06);
+  --shadow-md: 0 4px 12px -2px rgba(17, 11, 107, 0.1),
+    0 2px 6px -2px rgba(17, 11, 107, 0.06);
+  --shadow-lg: 0 12px 28px -8px rgba(17, 11, 107, 0.16),
+    0 4px 10px -4px rgba(17, 11, 107, 0.08);
+  --shadow-xl: 0 24px 48px -12px rgba(17, 11, 107, 0.22),
+    0 8px 16px -8px rgba(17, 11, 107, 0.1);
+  --shadow-2xl: 0 40px 80px -20px rgba(7, 5, 54, 0.35);
+  --shadow-cyan: 0 0 0 1px rgba(0, 229, 229, 0.35),
+    0 10px 28px -8px rgba(0, 229, 229, 0.38);
+  --shadow-inset-top: inset 0 1px 0 0 rgba(255, 255, 255, 0.09);
+  --shadow-focus: 0 0 0 3px rgba(0, 229, 229, 0.45);
+  --shadow-focus-on-dark: 0 0 0 3px rgba(0, 229, 229, 0.55);
+  --shadow-focus-danger: 0 0 0 3px rgba(240, 68, 56, 0.35);
+
+  /* ── KABUK ÖLÇÜLERİ (§4.1-4.3) ──────────────────────────────────────
+     h-topbar / h-navbar / h-catnav olarak kullanılır. */
+  --spacing-topbar: 36px;
+  --spacing-navbar: 76px;
+  --spacing-catnav: 48px;
+}
+
+:root {
+  /* ── GRADIENTLER (§1.6) — Tailwind namespace'i yok, düz değişken ───── */
+  --gradient-hero: linear-gradient(
+    135deg,
+    #0c0850 0%,
+    #110b6b 48%,
+    #241a85 100%
+  );
+  --gradient-hero-glow: radial-gradient(
+    58% 78% at 82% 18%,
+    rgba(0, 229, 229, 0.22) 0%,
+    rgba(0, 229, 229, 0) 68%
+  );
+  --gradient-deep: linear-gradient(180deg, #0c0850 0%, #05041f 100%);
+  --gradient-sidebar: linear-gradient(180deg, #110b6b 0%, #0a0748 100%);
+  --gradient-panel: linear-gradient(
+    135deg,
+    #110b6b 0%,
+    #1b1180 55%,
+    #0c0850 100%
+  );
+  --gradient-panel-spot: radial-gradient(
+    120% 120% at 0% 0%,
+    rgba(255, 255, 255, 0.09) 0%,
+    rgba(255, 255, 255, 0) 60%
+  );
+  --gradient-cta: linear-gradient(135deg, #00e5e5 0%, #00c2c2 100%);
+  --gradient-rule: linear-gradient(
+    90deg,
+    #00e5e5 0%,
+    rgba(0, 229, 229, 0) 100%
+  );
+  --gradient-shimmer: linear-gradient(
+    90deg,
+    #ebeef4 0%,
+    #f4f6fa 50%,
+    #ebeef4 100%
+  );
+
+  /* ── HAREKET (§3.6) ─────────────────────────────────────────────────── */
+  --ease: cubic-bezier(0.22, 0.61, 0.36, 1);
+
+  /* ── GERİYE UYUMLULUK — ön ek'siz köprü değişkenleri (storefront) ────
+     `bg-[var(--brand-blue)]` gibi ~1000 kullanım. SİLİNMEYECEK. */
+  --brand-navy: var(--color-navy-800);
+  --brand-blue: var(--color-navy-700);
+  --surface: var(--color-surface);
+  --surface-muted: var(--color-ink-50);
+  --text: var(--color-ink-800);
+  --text-muted: var(--color-ink-500);
+  --border: var(--color-ink-200);
+  --success: var(--color-success-700);
+  --danger: var(--color-danger-700);
+}
+
+/* ── FOCUS — tek kural, her yerde (§3.5) ────────────────────────────────
+   `@layer` dışında olduğu için Tailwind utility'lerinin (shadow-sm vb.)
+   üstünde kalır; focus halkası hiçbir yerde kaybolmaz. */
+:where(a, button, input, select, textarea, summary, [tabindex]):focus-visible {
+  outline: none;
+  box-shadow: var(--shadow-focus);
+  border-color: var(--color-navy-700);
+}
+
+::selection {
+  background: var(--color-cyan-100);
+  color: var(--color-navy-950);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* ───────────────────────────── SYNC BİTİŞ ───────────────────────────── */
+
+/* ==========================================================================
+   ADMIN'E ÖZEL — bu bölüm storefront'a KOPYALANMAZ
+   ========================================================================== */
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  background-color: var(--color-bg-muted);
+  color: var(--color-fg);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Admin navbar — yatay scrollbar'ı gizle ama scroll davranışını koru.
+   "Kader çizgisi" diye anılan alt çizginin yer yer kaybolmaması için
+   sadece scrollbar görseli saklanıyor. */
+.admin-navbar-scroll {
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+.admin-navbar-scroll::-webkit-scrollbar {
+  display: none;
+}
+
+/* Sidebar rail — kapalı durumda hover scroll yapsa bile dikey scrollbar
+   görünmesin. AdminShell <nav>'inde scrollbar-hide olarak kullanılıyor. */
+.scrollbar-hide {
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+.scrollbar-hide::-webkit-scrollbar {
+  display: none;
+}

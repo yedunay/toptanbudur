@@ -1,0 +1,153 @@
+# ------------------------------------------------------------------
+# DEV overlay — full stack on your laptop, single `docker compose up`.
+#
+# Selected automatically when .env contains:
+#   COMPOSE_FILE=docker-compose.yml:docker-compose.dev.yml
+#
+# Behaviour:
+#   - Data tier (postgres/redis/minio) exposed on 127.0.0.1 ONLY.
+#     Postgres and MinIO live in this overlay (NOT the base) because
+#     they don't run in prod: prod's DB is a remote native daemon,
+#     and prod's object storage is Cloudflare R2.
+#   - All three apps (backend/frontend/admin) run in containers
+#     with bind-mounted source for hot reload — same DX as native
+#     `pnpm dev` but no host pnpm/Node version drift.
+#   - Each app's node_modules is held in an anonymous volume so the
+#     host's (different arch / different lockfile state) directory
+#     doesn't shadow the one installed inside the image.
+#   - Backend runs `prisma migrate deploy` on startup; first `up` after
+#     a schema change applies pending migrations automatically.
+#
+# To temporarily bypass app containers and run `pnpm dev` natively (e.g. for
+# debugging with editor breakpoints), specify only the data-tier services:
+#   docker compose up postgres redis minio
+# Then run `pnpm dev` in apps/{backend,frontend,admin} as before.
+# ------------------------------------------------------------------
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: tb-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER is required in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required in .env}
+      POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB is required in .env}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - tb-net
+
+  redis:
+    ports:
+      - "127.0.0.1:6379:6379"
+
+  minio:
+    image: minio/minio:latest
+    container_name: tb-minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?MINIO_ROOT_USER is required in .env}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?MINIO_ROOT_PASSWORD is required in .env}
+      MINIO_REGION: ${MINIO_REGION:-auto}
+    volumes:
+      - minio_data:/data
+    ports:
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+    networks:
+      - tb-net
+
+  backend:
+    build:
+      context: ./apps/backend
+      dockerfile: Dockerfile
+      target: dev
+    container_name: tb-backend
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      # Container-internal hostnames override the localhost values from
+      # root .env (which target the loopback ports for native pnpm dev).
+      # sslmode=disable: dev postgres container SSL desteklemiyor; adapter-pg
+      # default SSL prefer ettiği için TlsConnectionError'a düşüyor.
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?schema=public&sslmode=disable
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      PORT: "4000"
+      NODE_ENV: development
+      # Local storage stays inside the bind-mounted source so uploads are
+      # visible in apps/backend/uploads on the host.
+      LOCAL_STORAGE_ROOT: /app/uploads
+    ports:
+      - "127.0.0.1:4000:4000"
+    volumes:
+      - ./apps/backend:/app
+      - backend_node_modules:/app/node_modules
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_started
+    networks:
+      - tb-net
+
+  frontend:
+    build:
+      context: ./apps/frontend
+      dockerfile: Dockerfile
+      target: runner
+    container_name: tb-frontend
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      PORT: "3001"
+      HOSTNAME: 0.0.0.0
+      TB_API_BASE: http://backend:4000
+      INTERNAL_API_BASE: http://backend:4000/api
+    ports:
+      - "127.0.0.1:3001:3001"
+    depends_on:
+      - backend
+    networks:
+      - tb-net
+
+  admin:
+    build:
+      context: ./apps/admin
+      dockerfile: Dockerfile
+      target: runner
+    container_name: tb-admin
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3002:3002"
+    volumes:
+      - ./apps/admin/dist:/usr/share/nginx/html/admin:ro
+    depends_on:
+      - backend
+    networks:
+      - tb-net
+
+volumes:
+  postgres_data:
+  minio_data:
+  backend_node_modules:
+
+networks:
+  tb-net:
+    driver: bridge

@@ -1,0 +1,53 @@
+name: tb-platform
+
+# ------------------------------------------------------------------
+# BASE — only services that exist in every environment.
+#
+# Postgres ve MinIO bilinçli olarak burada YOK:
+#   - Postgres prod'da ayrı bir Hetzner sunucusunda native daemon olarak
+#     koşar (private network üzerinden bağlanılır). Yalnızca dev'de
+#     container içinde kalkar — bkz. docker-compose.dev.yml.
+#   - Object storage prod'da Cloudflare R2 (STORAGE_DRIVER=r2). Dev'de
+#     hâlâ yerel MinIO kullanılır — bkz. docker-compose.dev.yml.
+#
+# Redis her iki ortamda da container içinde koşar; dev'de port host'a
+# açılır, prod'da iç network'te kalır.
+#
+# Aktif overlay .env'deki COMPOSE_FILE ile seçilir:
+#
+#   Local dev:
+#     COMPOSE_FILE=docker-compose.yml:docker-compose.dev.yml
+#     → redis (base) + postgres/minio + tüm app'ler container içinde.
+#
+#   Production:
+#     COMPOSE_FILE=docker-compose.yml:docker-compose.prod.yml
+#     → redis (base) + backend/frontend/admin/nginx/certbot.
+#       Postgres uzak sunucu, object storage R2.
+#
+# Env yapısı: backend için apps/backend/.env (standalone), root /.env compose
+# container init (POSTGRES_*/MINIO_*) + DOMAIN/TENANT_SLUG gibi paylaşılan
+# değerler. Frontend ve admin kendi .env dosyalarını okur.
+# ------------------------------------------------------------------
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: tb-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks:
+      - tb-net
+
+volumes:
+  redis_data:
+
+networks:
+  tb-net:
+    driver: bridge

@@ -1,0 +1,42 @@
+# Local development Caddyfile
+# Run: caddy run --config Caddyfile.local
+# Access: https://toptanbudur.localhost:8443  (Caddy auto-issues local CA cert)
+# HTTP:   http://toptanbudur.localhost:8080
+#
+# On macOS, ports <1024 require root; we bind 8080/8443 instead.
+
+{
+	# Disable automatic HTTPS for non-public hostnames? No — Caddy uses local CA for *.localhost.
+	auto_https disable_redirects
+	http_port 8080
+	https_port 8443
+}
+
+http://toptanbudur.localhost:8080, https://toptanbudur.localhost:8443 {
+	tls internal
+
+	encode zstd gzip
+
+	header {
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		-Server
+	}
+
+	@api path /api /api/*
+	handle @api {
+		reverse_proxy localhost:4000
+	}
+
+	handle /admin/* {
+		header X-Robots-Tag "noindex, nofollow"
+		reverse_proxy localhost:3002
+	}
+	handle /admin {
+		redir /admin/ 308
+	}
+
+	handle {
+		reverse_proxy localhost:3001
+	}
+}

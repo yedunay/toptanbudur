@@ -1,0 +1,205 @@
+# ------------------------------------------------------------------
+# PROD overlay — full stack on the server.
+#
+# Selected automatically when .env contains:
+#   COMPOSE_FILE=docker-compose.yml:docker-compose.prod.yml
+#
+# Required env (4 ayrı dosya, sıkı izole):
+#   Root /.env                — DOMAIN, LETSENCRYPT_*, INCLUDE_WWW, TENANT_SLUG,
+#                               TELEGRAM_*, WATCHDOG_* (sadece compose okur)
+#   apps/backend/.env         — DATABASE_URL (uzak postgres), JWT_*,
+#                               VAULT_MASTER_KEY, PASSWORD_VAULT_KEY, ORDER_TOKEN_*,
+#                               R2_*, SMTP_*, BIRFATURA_*
+#   apps/frontend/.env.local  — NEXT_PUBLIC_*, INTERNAL_API_BASE
+#   apps/admin/.env           — VITE_*
+#
+# Data tier:
+#   - PostgreSQL: ayrı sunucuda native daemon. Container yok, depends_on
+#     yok; backend `apps/backend/.env`'deki DATABASE_URL ile uzak host'a bağlanır.
+#   - Object storage: Cloudflare R2 (STORAGE_DRIVER=r2). MinIO container
+#     yok; backend AWS SDK üzerinden R2 endpoint'ine konuşur.
+#   - Redis: hâlâ container içinde (tb-net iç bridge'de).
+#
+# Behaviour:
+#   - Adds backend/frontend/admin built from their Dockerfiles.
+#   - nginx is the ONLY service publishing host ports (80, 443).
+#     All app services live on the internal `tb-net` bridge.
+#   - certbot obtains and auto-renews the Let's Encrypt cert for
+#     ${DOMAIN}; nginx reloads itself every 6h to pick up renewals.
+# ------------------------------------------------------------------
+
+services:
+  backend:
+    build:
+      context: ./apps/backend
+      dockerfile: Dockerfile
+    container_name: tb-backend
+    restart: unless-stopped
+    # Backend tüm secret'larını apps/backend/.env'den okur — DATABASE_URL,
+    # JWT_*, R2_*, SMTP_*, BIRFATURA_* dahil. Compose'un kendisi root /.env'i
+    # backend secret'ları için kullanmaz.
+    env_file:
+      - apps/backend/.env
+    environment:
+      # env_file'ı override eden compose-spesifik / DOMAIN-türevli değerler:
+      NODE_ENV: production
+      PORT: "4000"
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      CORS_ORIGINS: https://${DOMAIN}
+      STORAGE_PUBLIC_BASE_URL: ${STORAGE_PUBLIC_BASE_URL:-https://${DOMAIN}}
+      LOCAL_STORAGE_ROOT: /var/lib/tb-uploads
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    volumes:
+      # Backend STORAGE_DRIVER=r2 ile çalışırken bu volume yazılmıyor; yine de
+      # kalsın ki gerekirse local driver'a fallback edilebilsin (ör. R2 outage).
+      - backend_uploads:/var/lib/tb-uploads
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - tb-net
+
+  frontend:
+    build:
+      context: ./apps/frontend
+      dockerfile: Dockerfile
+      args:
+        # NEXT_PUBLIC_* values are baked into the client bundle at build
+        # time. They MUST resolve to the public domain (or relative paths) —
+        # if they default to `localhost:*` every link in the UI breaks for
+        # external visitors. Browser uses these; server-side code uses
+        # INTERNAL_API_BASE.
+        NEXT_PUBLIC_API_BASE: /api
+        NEXT_PUBLIC_API_URL: https://${DOMAIN}
+        NEXT_PUBLIC_XML_FEED_BASE: https://${DOMAIN}/xml/customer
+        NEXT_PUBLIC_STOREFRONT_URL: https://${DOMAIN}
+        NEXT_PUBLIC_ADMIN_URL: https://${DOMAIN}/admin
+        NEXT_PUBLIC_ADMIN_LOGIN_URL: https://${DOMAIN}/admin/login
+        NEXT_PUBLIC_TENANT_SLUG: ${TENANT_SLUG:-toptanbudur}
+        # Contact info inlined into the client bundle — must be present at
+        # build time, runtime values are ignored by Next.js.
+        NEXT_PUBLIC_WHATSAPP_NUMBER: ${NEXT_PUBLIC_WHATSAPP_NUMBER:-}
+        NEXT_PUBLIC_CONTACT_PHONE_E164: ${NEXT_PUBLIC_CONTACT_PHONE_E164:-}
+        NEXT_PUBLIC_CONTACT_PHONE_DISPLAY: ${NEXT_PUBLIC_CONTACT_PHONE_DISPLAY:-}
+        NEXT_PUBLIC_CONTACT_EMAIL: ${NEXT_PUBLIC_CONTACT_EMAIL:-}
+    container_name: tb-frontend
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      PORT: "3001"
+      HOSTNAME: 0.0.0.0
+      # Server-side calls from Next.js → NestJS go over the docker bridge.
+      # TB_API_BASE is read by lib/auth-server.ts (getServerCustomer); without
+      # it SSR falls back to NEXT_PUBLIC_API_URL=https://${DOMAIN}, forcing the
+      # SSR auth check through nginx (slow, fragile) and breaking cross-app
+      # session visibility (keskin kural).
+      INTERNAL_API_BASE: http://backend:4000/api
+      TB_API_BASE: http://backend:4000
+      NEXT_PUBLIC_API_BASE: /api
+    depends_on:
+      - backend
+    networks:
+      - tb-net
+
+  admin:
+    build:
+      context: ./apps/admin
+      dockerfile: Dockerfile
+      args:
+        # Vite inlines these at build-time, same constraint as Next.js NEXT_PUBLIC_*.
+        # Same-domain so the SPA hits /api on whatever host served the page.
+        VITE_API_BASE: /api
+        VITE_LANDING_URL: https://${DOMAIN}
+        VITE_STOREFRONT_URL: https://${DOMAIN}
+    container_name: tb-admin
+    restart: unless-stopped
+    depends_on:
+      - backend
+    networks:
+      - tb-net
+
+  nginx:
+    build:
+      context: ./infra/nginx
+      dockerfile: Dockerfile
+    image: tb-platform-nginx
+    container_name: tb-nginx
+    restart: unless-stopped
+    # IMPORTANT: do NOT override `command:` here. nginx:alpine's entrypoint only
+    # runs the /docker-entrypoint.d/* scripts (envsubst, our init-certs, our
+    # reload loop) when ARGV[0] == "nginx". Overriding to /bin/sh skips them.
+    # Cert renewal pickup happens via 60-reload-loop.sh which sends SIGHUP
+    # every 6h.
+    environment:
+      DOMAIN: ${DOMAIN:?DOMAIN is required - set it in root /.env}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./infra/nginx/templates:/etc/nginx/templates:ro
+      - ./infra/nginx/init-certs.sh:/docker-entrypoint.d/40-init-certs.sh:ro
+      - ./infra/nginx/reload-loop.sh:/docker-entrypoint.d/60-reload-loop.sh:ro
+      - letsencrypt:/etc/letsencrypt
+      - certbot_webroot:/var/www/certbot
+      - nginx_logs:/var/log/nginx
+    depends_on:
+      backend:
+        condition: service_started
+      frontend:
+        condition: service_started
+      admin:
+        condition: service_started
+    networks:
+      - tb-net
+
+  # Watchdog — public URL'i her dakika prob eder, çökme anında yapılandırılan
+  # Telegram kanalına mesaj atar. Ayrı container olması kritik: backend/nginx
+  # çökse bile bu süreç ayakta kalsın diye. Tüm stack'i bypass edip
+  # public domain'i kullanıcı gibi dışarıdan ziyaret eder (hairpin NAT).
+  watchdog:
+    image: node:20-alpine
+    container_name: tb-watchdog
+    restart: unless-stopped
+    command: ["node", "/app/watchdog.js"]
+    volumes:
+      - ./infra/watchdog/watchdog.js:/app/watchdog.js:ro
+    environment:
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:?TELEGRAM_BOT_TOKEN is required in .env}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:?TELEGRAM_CHAT_ID is required in .env}
+      WATCHDOG_TARGET_URL: https://${DOMAIN}/api/health
+      WATCHDOG_INTERVAL_MS: ${WATCHDOG_INTERVAL_MS:-60000}
+      WATCHDOG_TIMEOUT_MS: ${WATCHDOG_TIMEOUT_MS:-15000}
+      WATCHDOG_FAIL_THRESHOLD: ${WATCHDOG_FAIL_THRESHOLD:-2}
+      WATCHDOG_NOTIFY_RECOVERY: ${WATCHDOG_NOTIFY_RECOVERY:-0}
+      WATCHDOG_SITE_LABEL: ${DOMAIN}
+    networks:
+      - tb-net
+
+  certbot:
+    image: certbot/certbot:latest
+    container_name: tb-certbot
+    restart: unless-stopped
+    entrypoint: ["/bin/sh", "/entrypoint.sh"]
+    environment:
+      DOMAIN: ${DOMAIN:?DOMAIN is required}
+      LETSENCRYPT_EMAIL: ${LETSENCRYPT_EMAIL:?LETSENCRYPT_EMAIL is required}
+      LETSENCRYPT_STAGING: ${LETSENCRYPT_STAGING:-0}
+      # Set to 1 only after `www.${DOMAIN}` resolves to the same IP as the apex.
+      # Many TR registrars CNAME `www` to a CDN/redirect by default, which fails ACME.
+      INCLUDE_WWW: ${INCLUDE_WWW:-0}
+    volumes:
+      - ./infra/certbot/entrypoint.sh:/entrypoint.sh:ro
+      - letsencrypt:/etc/letsencrypt
+      - certbot_webroot:/var/www/certbot
+    depends_on:
+      nginx:
+        condition: service_started
+    networks:
+      - tb-net
+
+volumes:
+  letsencrypt:
+  certbot_webroot:
+  nginx_logs:
+  backend_uploads:

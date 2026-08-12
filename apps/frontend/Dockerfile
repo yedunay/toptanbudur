@@ -1,0 +1,63 @@
+# syntax=docker/dockerfile:1.7
+FROM node:20-alpine AS deps
+RUN npm install -g pnpm@9.15.0
+WORKDIR /app
+COPY package.json pnpm-lock.yaml ./
+RUN pnpm install --no-frozen-lockfile
+
+FROM node:20-alpine AS dev
+RUN npm install -g pnpm@9.15.0
+WORKDIR /app
+ENV NODE_ENV=development
+ENV NEXT_TELEMETRY_DISABLED=1
+ENV HOSTNAME=0.0.0.0
+COPY --from=deps /app/node_modules ./node_modules
+EXPOSE 3001
+CMD ["sh", "-c", "pnpm install --no-frozen-lockfile && pnpm dev"]
+
+FROM node:20-alpine AS builder
+RUN npm install -g pnpm@9.15.0
+WORKDIR /app
+ENV NEXT_TELEMETRY_DISABLED=1
+
+ARG NEXT_PUBLIC_API_BASE=http://localhost:4000/api
+ARG NEXT_PUBLIC_API_URL=http://localhost:4000
+ARG NEXT_PUBLIC_XML_FEED_BASE=http://localhost:4000/xml/customer
+ARG NEXT_PUBLIC_LANDING_URL=http://localhost:3001
+ARG NEXT_PUBLIC_STOREFRONT_URL=http://localhost:3001
+ARG NEXT_PUBLIC_ADMIN_URL=http://localhost:3002/admin
+ARG NEXT_PUBLIC_ADMIN_LOGIN_URL=http://localhost:3002/admin/login
+ARG NEXT_PUBLIC_TENANT_SLUG=toptanbudur
+ARG NEXT_PUBLIC_WHATSAPP_NUMBER=
+ARG NEXT_PUBLIC_CONTACT_PHONE_E164=
+ARG NEXT_PUBLIC_CONTACT_PHONE_DISPLAY=
+ARG NEXT_PUBLIC_CONTACT_EMAIL=
+
+ENV NEXT_PUBLIC_API_BASE=$NEXT_PUBLIC_API_BASE \
+    NEXT_PUBLIC_API_URL=$NEXT_PUBLIC_API_URL \
+    NEXT_PUBLIC_XML_FEED_BASE=$NEXT_PUBLIC_XML_FEED_BASE \
+    NEXT_PUBLIC_LANDING_URL=$NEXT_PUBLIC_LANDING_URL \
+    NEXT_PUBLIC_STOREFRONT_URL=$NEXT_PUBLIC_STOREFRONT_URL \
+    NEXT_PUBLIC_ADMIN_URL=$NEXT_PUBLIC_ADMIN_URL \
+    NEXT_PUBLIC_ADMIN_LOGIN_URL=$NEXT_PUBLIC_ADMIN_LOGIN_URL \
+    NEXT_PUBLIC_TENANT_SLUG=$NEXT_PUBLIC_TENANT_SLUG \
+    NEXT_PUBLIC_WHATSAPP_NUMBER=$NEXT_PUBLIC_WHATSAPP_NUMBER \
+    NEXT_PUBLIC_CONTACT_PHONE_E164=$NEXT_PUBLIC_CONTACT_PHONE_E164 \
+    NEXT_PUBLIC_CONTACT_PHONE_DISPLAY=$NEXT_PUBLIC_CONTACT_PHONE_DISPLAY \
+    NEXT_PUBLIC_CONTACT_EMAIL=$NEXT_PUBLIC_CONTACT_EMAIL
+
+COPY --from=deps /app/node_modules ./node_modules
+COPY . .
+RUN pnpm build
+
+FROM node:20-alpine AS runner
+WORKDIR /app
+ENV NODE_ENV=production
+ENV NEXT_TELEMETRY_DISABLED=1
+ENV PORT=3001
+ENV HOSTNAME=0.0.0.0
+COPY --from=builder /app/public ./public
+COPY --from=builder /app/.next/standalone ./
+COPY --from=builder /app/.next/static ./.next/static
+EXPOSE 3001
+CMD ["node", "server.js"]
