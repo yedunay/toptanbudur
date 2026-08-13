@@ -27,11 +27,19 @@ import { PrismaPg } from '@prisma/adapter-pg';
 import * as bcrypt from 'bcrypt';
 
 const TENANT_SLUG = process.env.SEED_TENANT_SLUG ?? 'toptanbudur';
-const TENANT_NAME = process.env.SEED_TENANT_NAME ?? 'Toptan Budur';
-const ADMIN_EMAIL = process.env.SEED_ADMIN_EMAIL ?? 'admin@toptanbudur.com';
-const ADMIN_PASSWORD =
-  process.env.SEED_ADMIN_PASSWORD ?? 'TbAdmin!2026.Degistir';
-const PASSWORD_FROM_ENV = Boolean(process.env.SEED_ADMIN_PASSWORD);
+// `??` yerine boşluk-kırpılmış kontrol: `.env.example` dosyalarında bu
+// anahtarlar BOŞ olarak bulunuyor; `??` boş string'i "verilmiş" sayıp
+// PAROLASIZ admin oluşturuyordu (giriş her denemede 401 dönüyordu).
+const envOr = (key: string, fallback: string): string => {
+  const v = process.env[key];
+  return v !== undefined && v.trim() !== '' ? v : fallback;
+};
+
+const TENANT_NAME = envOr('SEED_TENANT_NAME', 'Toptan Budur');
+const ADMIN_EMAIL = envOr('SEED_ADMIN_EMAIL', 'admin@toptanbudur.com');
+const ADMIN_PASSWORD = envOr('SEED_ADMIN_PASSWORD', 'TbAdmin!2026.Degistir');
+const PASSWORD_FROM_ENV =
+  (process.env.SEED_ADMIN_PASSWORD ?? '').trim() !== '';
 
 const connectionString = process.env.DATABASE_URL;
 if (!connectionString) {
