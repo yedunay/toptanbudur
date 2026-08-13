@@ -165,8 +165,8 @@ services:
     volumes:
       - ./infra/watchdog/watchdog.js:/app/watchdog.js:ro
     environment:
-      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:?TELEGRAM_BOT_TOKEN is required in .env}
-      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:?TELEGRAM_CHAT_ID is required in .env}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
       WATCHDOG_TARGET_URL: https://${DOMAIN}/api/health
       WATCHDOG_INTERVAL_MS: ${WATCHDOG_INTERVAL_MS:-60000}
       WATCHDOG_TIMEOUT_MS: ${WATCHDOG_TIMEOUT_MS:-15000}
