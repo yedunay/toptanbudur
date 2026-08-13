@@ -1,0 +1,65 @@
+# ---------------------------------------------------------------------------
+# DOMAINSIZ (IP üzerinden, TLS'siz) KURULUM OVERLAY'i — GEÇİCİ.
+#
+# Kullanım (root /.env içinde):
+#   COMPOSE_FILE=docker-compose.yml:docker-compose.prod.yml:docker-compose.ip.yml
+#   PUBLIC_HOST=139.162.158.23
+#   DOMAIN=139.162.158.23              # prod compose parse ederken zorunlu
+#   LETSENCRYPT_EMAIL=dev@example.com  # certbot BAŞLATILMAYACAK, sadece parse için
+#
+# Başlatma (nginx ve certbot BAŞLATILMAZ, yerine nginx-ip kullanılır):
+#   docker compose up -d redis backend frontend admin nginx-ip
+#
+# Domain bağlanınca: bu overlay'i COMPOSE_FILE'dan çıkar, DOMAIN'i gerçek
+# domain yap, `docker compose up -d --build` ile normal nginx + certbot'a geç.
+# frontend/admin İMAJLARI YENİDEN DERLENMELİ (NEXT_PUBLIC_*/VITE_* build-time
+# gömülür; aksi halde arayüzdeki mutlak linkler http://IP olarak kalır).
+# ---------------------------------------------------------------------------
+
+services:
+  backend:
+    environment:
+      # TLS yok → https şeması kullanılamaz.
+      CORS_ORIGINS: http://${PUBLIC_HOST}
+      STORAGE_PUBLIC_BASE_URL: http://${PUBLIC_HOST}
+      # Secure çerez düz HTTP'de tarayıcı tarafından GÖNDERİLMEZ → giriş
+      # sessizce başarısız olur. TLS gelene kadar kapalı.
+      SESSION_COOKIE_SECURE: "false"
+      # IP adresleri için Domain nitelikli çerez tarayıcıca REDDEDİLİR.
+      # Boş bırakılınca host-only çerez üretilir.
+      SESSION_COOKIE_DOMAIN: ""
+
+  frontend:
+    build:
+      args:
+        NEXT_PUBLIC_API_URL: http://${PUBLIC_HOST}
+        NEXT_PUBLIC_STOREFRONT_URL: http://${PUBLIC_HOST}
+        NEXT_PUBLIC_ADMIN_URL: http://${PUBLIC_HOST}/admin
+        NEXT_PUBLIC_ADMIN_LOGIN_URL: http://${PUBLIC_HOST}/admin/login
+
+  admin:
+    build:
+      args:
+        VITE_LANDING_URL: http://${PUBLIC_HOST}
+        VITE_STOREFRONT_URL: http://${PUBLIC_HOST}
+
+  # TLS'siz, sertifikasız nginx. Prod'daki `nginx` servisi (Let's Encrypt
+  # bekler) BAŞLATILMAZ; ikisi de 80 portunu kullandığı için aynı anda
+  # çalıştırılamaz.
+  nginx-ip:
+    image: nginx:1.27-alpine
+    container_name: tb-nginx-ip
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    volumes:
+      - ./infra/nginx-ip/default.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      backend:
+        condition: service_started
+      frontend:
+        condition: service_started
+      admin:
+        condition: service_started
+    networks:
+      - tb-net
