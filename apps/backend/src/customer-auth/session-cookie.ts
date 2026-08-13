@@ -5,14 +5,33 @@ const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
 
 export function buildSessionCookieOptions(): CookieOptions {
   const isProd = process.env.NODE_ENV === 'production';
+
+  // Çerez alanı. Boş string ("") verilirse host-only çerez üretilir — IP
+  // üzerinden (domainsiz) yayında ZORUNLUDUR: tarayıcılar IP adresi için
+  // Domain nitelikli çerezi tümden reddeder, oturum sessizce açılmaz.
+  const rawDomain = process.env.SESSION_COOKIE_DOMAIN;
   const domain =
-    process.env.SESSION_COOKIE_DOMAIN ?? (isProd ? '.toptanbudur.com' : 'localhost');
+    rawDomain === undefined
+      ? isProd
+        ? undefined // domain verilmediyse host-only: her kuruluma uyar
+        : 'localhost'
+      : rawDomain.trim() === ''
+        ? undefined
+        : rawDomain.trim();
+
+  // Secure bayrağı. Varsayılan NODE_ENV'e bağlı, ama TLS olmadan (ör. IP
+  // üzerinden HTTP ile geliştirme) çalışırken kapatılabilmeli: Secure çerez
+  // düz HTTP'de tarayıcı tarafından GÖNDERİLMEZ ve giriş sessizce başarısız olur.
+  const secureEnv = process.env.SESSION_COOKIE_SECURE;
+  const secure =
+    secureEnv === undefined ? isProd : secureEnv.toLowerCase() === 'true';
+
   return {
     httpOnly: true,
-    secure: isProd,
+    secure,
     sameSite: 'lax',
     path: '/',
-    domain,
+    ...(domain ? { domain } : {}),
     maxAge: SEVEN_DAYS_MS,
   };
 }
